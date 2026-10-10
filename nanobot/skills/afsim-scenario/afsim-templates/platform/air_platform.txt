@@ -1,0 +1,52 @@
+# 武器平台模板（防空导弹系统）
+#
+# 用途：典型 SAM（地对空导弹）发射车 + 跟踪雷达 + 火控系统
+# 验证来源：../Afsim_demoslists/engage项目汇总.md line 22-100
+
+radar_signature FIGHTER_RADAR_SIGNATURE
+   constant 1.0 m^2
+end_radar_signature
+
+platform_type LAUNCHER_TYPE WSF_PLATFORM
+   side red
+   icon SA-10_Launcher
+
+   # --- 通信系统 ---
+   comm comm WSF_COMM_TRANSCEIVER
+      internal_link operator
+   end_comm
+
+   # --- 传感器 ---
+   sensor find WSF_GEOMETRIC_SENSOR
+      ignore_same_side
+      frame_time 10 sec
+      reports_location
+      on
+      track_quality 0.5
+      internal_link tracker
+   end_sensor
+
+   sensor ttr <TTR_RADAR_TYPE>
+      on
+      internal_link tracker
+   end_sensor
+
+   # --- 处理器 ---
+   processor tracker WSF_TRACK_PROCESSOR
+   end_processor
+
+   processor operator WSF_TASK_PROCESSOR
+      show_state_transitions
+      # ... 状态机定义（见 ../templates/processor/task_processor.txt）...
+   end_processor
+
+   # --- 武器 ---
+   weapon lrsam LRSAM
+      quantity 1
+   end_weapon
+end_platform_type
+
+platform launcher1 LAUNCHER_TYPE
+   side red
+   position 40:00:00n 116:00:00e altitude 0 ft msl
+end_platform

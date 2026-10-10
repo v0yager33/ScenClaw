@@ -1,0 +1,73 @@
+# 通用全局配置模板
+#
+# 用途：仿真顶层配置（时间、输出、随机种子等）
+# 验证来源：../Afsim_demoslists/engage项目汇总.md, satellite_demos项目汇总.md
+
+# --- 时间配置 ---
+random_seed 1
+# 随机种子（用于重复仿真）
+
+end_time 30 sec
+# 仿真结束时间（支持：sec, min, hr, day）
+
+frame_time 0.01 sec
+# 全局帧时间
+
+# start_date sep 22 2020
+# start_time 12:00:00.000
+# 仿真开始日期和时间（卫星仿真需要）
+
+# --- 输出配置 ---
+log_file output/minimal_test.log
+# 日志文件路径
+
+output_rate default
+   time <value> <unit> period <value> <unit>
+end_output_rate
+# 输出速率配置
+
+event_pipe
+   file output/scenario_name.aer
+end_event_pipe
+# 事件管道输出（.aer 格式）
+
+event_output
+   file output/scenario_name.evt
+   enable all
+end_event_output
+# 事件输出（.evt 格式）
+
+dis_interface
+   exercise 1
+   site 25
+end_dis_interface
+# DIS 接口配置
+
+csv_event_output
+   file output/scenario_name.csv
+end_csv_event_output
+# CSV 格式事件输出
+
+# --- 文件包含 ---
+include weapons/lrsam.txt
+include radars/lrsam_ttr.txt
+# 包含外部文件（相对路径）
+
+include_once ../signatures/blue_radar.txt
+# include_once：仅包含一次（防止重复定义）
+
+# --- 路径变量 ---
+define_path_variable CASE constellation_demo
+log_file output/$(CASE).log
+# 定义路径变量，便于多场景复用
+
+file_path .
+# 设置文件搜索路径
+
+# --- 线程控制 ---
+thread_count 1
+# 并行线程数（多核加速）
+
+# --- 实时仿真 ---
+realtime
+# 实时模式运行仿真

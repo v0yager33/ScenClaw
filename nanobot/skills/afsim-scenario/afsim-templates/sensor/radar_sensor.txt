@@ -1,0 +1,106 @@
+# WSF_RADAR_SENSOR 雷达传感器模板（基础版）
+#
+# 用途：主动/被动雷达探测
+# 验证来源：../Afsim_demoslists/sensor_demos项目汇总.md line 39, 1380, 2065 等
+
+sensor <SENSOR_NAME> WSF_RADAR_SENSOR
+   # --- 基本参数 ---
+   frame_time 10 sec
+   # 帧时间
+
+   on
+   # 默认开启
+
+   # maximum_range 120 nm
+   # 最大探测距离（用于快速剔除，超出此范围的先验判断）
+
+   # minimum_range 0 nm
+   # 最小探测距离
+
+   # receive_only
+   # 纯接收模式（无发射机，如诱饵干扰机）
+
+   # transmit_only
+   # 纯发射模式（无接收机，如雷达照射器）
+
+   # --- 传感器位置与姿态 ---
+   location 0.0 0.0 -30 m
+   # 传感器在平台上的位置（NED 坐标系）
+
+   # antenna_height 10 m
+   # 天线高度（用于地形遮蔽计算）
+
+   # --- 扫描模式 ---
+   scan_mode azimuth
+   # 扫描模式：azimuth（方位扫描）、azimuth_and_elevation（方位+俯仰）
+   # 其他：slew（转动）、fixed（固定）
+
+   azimuth_scan_limits -180 deg 180 deg
+   # 方位扫描范围
+
+   # elevation_field_of_view -2.5 deg 42.5 deg
+   # 俯仰视野范围（需配合 azimuth_and_elevation 使用）
+
+   # antenna_tilt 10 deg
+   # 天线倾斜角
+
+   # --- 发射机块（主动雷达需要）---
+   transmitter
+      antenna_pattern <ANTENNA_PATTERN_NAME>
+      # 天线方向图名称（需先定义 antenna_pattern 块）
+
+      power 100 kw
+      # 发射功率
+
+      frequency 1.2 ghz
+      # 工作频率
+
+      polarization vertical
+      # 极化方式：vertical / horizontal / circular
+
+      # beam_tilt 10 deg
+      # 波束下倾角
+
+      # pulse_width 5 usec
+      # 脉冲宽度
+
+      # pulse_repetition_interval 100 usec
+      # 脉冲重复间隔
+
+      # internal_loss 8 db
+      # 内部损耗
+   end_transmitter
+
+   # --- 接收机块 ---
+   receiver
+      antenna_pattern <ANTENNA_PATTERN_NAME>
+      # 天线方向图名称
+
+      antenna_height 9 m
+      # 天线高度
+
+      frequency 100 mhz
+      # 工作频率（接收频率）
+
+      bandwidth 200 khz
+      # 带宽
+
+      # noise_figure 7 db
+      # 噪声系数
+
+      # check_transmitter_masking false
+      # 检查发射机遮蔽（双基地雷达设为 false）
+
+      # detection_threshold 5 db
+      # 检测阈值（ESM 传感器常用）
+
+      # integration_gain 1e5 absolute
+      # 积分增益（信号处理增益）
+
+      # probability_of_false_alarm 1.0e-6
+      # 虚警概率
+
+      # required_pd 0.9
+      # 所需发现概率
+   end_receiver
+end_sensor

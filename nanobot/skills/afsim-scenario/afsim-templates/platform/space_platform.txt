@@ -1,0 +1,75 @@
+# space_mover 卫星/轨道运动模板
+#
+# 用途：卫星、空间站等太空平台的轨道运动
+# 验证来源：../Afsim_demoslists/satellite_demos项目汇总.md line 209, 831, 5603 等
+
+# --- 基本轨道 mover（使用开普勒根数）---
+mover WSF_SPACE_MOVER
+   # semi_major_axis：半长轴（km），定义轨道大小
+   semi_major_axis 6778 km
+   # 6378km（地球平均半径）+ 400 km（轨道高度）
+
+   eccentricity 0.0
+   # 离心率（0 = 圆轨道）
+
+   inclination 55 deg
+   # 轨道倾角
+
+   # raan：升交点赤经（Right Ascension of Ascending Node）
+   # raan 0.0 deg
+
+   # anomaly：近地点幅角（Argument of Periapsis）
+   # anomaly 0.0 deg
+
+   # true_anomaly：真近点角（初始位置）
+   # true_anomaly 180 deg
+end_mover
+
+# --- 使用每日转数的简化卫星 ---
+mover WSF_SPACE_MOVER
+   designator <SATELLITE_NAME>
+   # 卫星设计代号
+
+   revs_per_day 2.1333333
+   # 每天环绕圈数（GPS MEO 约 2 圈/天）
+
+   inclination 55 deg
+end_mover
+
+# --- 带轨道事件调度的卫星 ---
+# （见 satellite_demos 项目中的 orbital_event 示例）
+
+# --- 带大气制动建模的卫星 ---
+mover WSF_SPACE_MOVER
+   eccentricity 0.0
+   inclination 22 deg
+   argument_of_periapsis 70 deg
+   periapsis_altitude 125 km
+   apoapsis_altitude 367344.31 km
+   true_anomaly 180 deg
+
+   # 积分器设置（大气制动建模）
+   integrator prince_dormand_78
+      error_criterion L_infinity
+      tolerance 1.0e-10
+      max_step_size 3600
+      min_step_size 0
+   end_integrator
+end_mover
+
+# --- 在 platform 实例中覆盖轨道参数 ---
+platform <SAT_NAME> <PLATFORM_TYPE>
+   edit mover
+      # 在实例级别覆盖 mover 参数
+      semi_major_axis 6998 km
+      inclination 29.5 deg
+      raan 0.0 deg
+      anomaly 0.0 deg
+   end_mover
+end_platform
+
+# --- 全局配置：仿真时间 ---
+start_date sep 22 2020
+start_time 12:00:00.000
+end_time 30 days
+# 支持单位：sec, min, hr, day

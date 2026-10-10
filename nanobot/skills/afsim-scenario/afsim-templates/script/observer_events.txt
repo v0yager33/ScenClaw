@@ -1,0 +1,49 @@
+# observer 观察者事件钩子模板
+#
+# 用途：监听仿真中的事件（武器终止、平台被击毁、命中等）并执行脚本
+# 验证来源：../Afsim_demoslists/script_demos项目汇总.md line 35-56
+
+# --- 事件脚本定义 ---
+script void PlaySoundBoom()
+   # 自定义脚本函数
+   System.Command("start wmplayer ..\\script_demos\\explosion.wav");
+end_script
+
+# --- 事件钩子函数 ---
+script void WeaponTerminated(WsfWeaponEngagement aWeaponEngagement)
+   # 武器终止时触发（飞离、诱饵等）
+   PlaySoundBoom();
+end_script
+
+script void PlatformKilled(WsfPlatform aPlatform)
+   # 平台被击毁时触发
+   PlaySoundBoom();
+end_script
+
+script void WeaponHit(WsfWeaponEngagement aWeaponEngagement, WsfPlatform aTargetPlatform)
+   # 武器命中目标时触发
+   PlaySoundBoom();
+end_script
+
+script void WeaponFired(WsfWeaponEngagement aWeaponEngagement, WsfTrack aTargetTrack)
+   # 武器发射时触发
+   PlaySoundBombDrop();
+end_script
+
+# --- observer 块：启用哪些事件 ---
+observer
+   enable WEAPON_TERMINATED
+   enable PLATFORM_BROKEN
+   enable WEAPON_HIT
+   enable WEAPON_FIRED
+end_observer
+
+# --- 常用 observer 事件类型 ---
+# WEAPON_TERMINATED    - 武器终止（超时/诱饵/自毁）
+# WEAPON_HIT          - 武器命中目标
+# WEAPON_FIRED        - 武器开火
+# WEAPON_MISSED       - 武器未命中
+# PLATFORM_KILLED     - 平台被摧毁
+# PLATFORM_BROKEN     - 平台受损
+# DETECTION           - 新目标被探测
+# TRACK_ESTABLISHED   - 航迹建立

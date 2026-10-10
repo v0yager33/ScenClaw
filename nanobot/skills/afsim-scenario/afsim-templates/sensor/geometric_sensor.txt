@@ -1,0 +1,30 @@
+# WSF_GEOMETRIC_SENSOR 几何传感器模板
+#
+# 用途：简单探测，基于几何计算（不考虑实际物理）
+# 验证来源：../Afsim_demoslists/engage项目汇总.md line 51
+# 验证来源：../Afsim_demoslists/sensor_demos项目汇总.md (EW radar 示例)
+
+sensor <SENSOR_NAME> WSF_GEOMETRIC_SENSOR
+   location <x> <y> <z> <unit>
+   # x/y/z：传感器在平台上的位置（NED坐标系），单位如 m、ft
+   # 示例：location 0 0 0 m（平台中心）
+   # 示例：location 0.0 0.0 -30 m（平台下方 30m）
+
+   ignore_same_side
+   # 忽略同阵营目标（常用于武器平台的搜索传感器）
+
+   frame_time 10 sec
+   # 帧时间，控制探测刷新频率
+
+   reports_location
+   # 报告目标位置（几何传感器需要此参数才能输出位置）
+
+   on
+   # 默认开启
+
+   track_quality 0.5
+   # 航迹质量 0-1，影响航迹稳定性
+
+   # internal_link <name>
+   # 内部链路，将探测数据发送到指定的处理器或通信设备
+end_sensor

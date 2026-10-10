@@ -1,0 +1,41 @@
+# signature 特征模板
+#
+# 用途：定义目标的雷达/光学特征（用于传感器探测计算）
+# 验证来源：../Afsim_demoslists/base_types项目汇总.md line 17, 21
+# 验证来源：../Afsim_demoslists/engage项目汇总.md line 18
+
+# --- radar_signature：固定 RCS ---
+radar_signature <SIGNATURE_NAME>
+   constant 1.0 m^2
+end_radar_signature
+
+# --- radar_signature：频率相关 RCS（PLT 文件）---
+radar_signature <SIGNATURE_NAME>
+   plt_file plt_radar_sig.txt default horizontal
+end_radar_signature
+
+# --- radar_signature：状态依赖 RCS ---
+radar_signature <SIGNATURE_NAME>
+   state default
+      polarization default
+         salram_file salram/newman.psam units dbsm
+end_radar_signature
+
+# --- radar_signature：双基地雷达 ---
+radar_signature <SIGNATURE_NAME>
+   constant .0001 m^2
+   bistatic_signature
+      azimuth -180 deg
+         elevation -90 deg
+            # 双基地配置
+end_radar_signature
+
+# --- optical_signature：固定光学特征（无基类型）---
+optical_signature <SIGNATURE_NAME>
+   constant 1000 m^2
+end_optical_signature
+
+# --- optical_signature：使用基类型 ---
+optical_signature <SIGNATURE_NAME> WSF_OPTICAL_SIGNATURE
+   intensity 100
+end_optical_signature

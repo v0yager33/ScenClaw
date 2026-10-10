@@ -1,0 +1,50 @@
+# WSF_TASK_PROCESSOR 任务处理器模板（多状态机版）
+#
+# 用途：武器平台的任务逻辑（搜索→跟踪→锁定→发射）
+# 验证来源：../Afsim_demoslists/engage项目汇总.md line 30-100
+
+processor <PROCESSOR_NAME> WSF_TASK_PROCESSOR
+   show_state_transitions
+   # 显示状态转换（调试用，生产环境可删除）
+
+   # --- 状态评估间隔（每个状态可单独设置） ---
+   evaluation_interval DETECTED 0.5 sec
+   state DETECTED
+      next_state TRY_TO_ACQUIRE
+         # 当检测到目标时，尝试进入跟踪获取状态
+         return StartTracking(TRACK, "DUMMY", PLATFORM.Sensor("ttr"), "SEARCH");
+      end_next_state
+   end_state
+
+   evaluation_interval TRY_TO_ACQUIRE 0.5 sec
+   state TRY_TO_ACQUIRE
+      next_state TRY_TO_TRACK
+         bool status = false;
+         # 航迹质量 > 0.65 时，开始捕获
+         if (TRACK.TrackQuality() > 0.65)
+         {
+            status = StartTracking(TRACK, "DUMMY", PLATFORM.Sensor("ttr"), "ACQUIRE");
+         }
+         return status;
+      end_next_state
+   end_state
+
+   evaluation_interval TRY_TO_TRACK 0.5 sec
+   state TRY_TO_TRACK
+      next_state TRY_TO_FIRE
+         bool status = false;
+         # 航迹质量 > 0.85 时，进入稳定跟踪
+         if (TRACK.TrackQuality() > 0.85)
+         {
+            status = StartTracking(TRACK, "DUMMY", PLATFORM.Sensor("ttr"), "TRACK");
+         }
+         return status;
+      end_next_state
+   end_state
+
+   evaluation_interval TRY_TO_FIRE 0.5 sec
+   state TRY_TO_FIRE
+      # 进入发射状态
+      return FireWeapon(TRACK, PLATFORM.Weapon("lrsam"));
+   end_state
+end_processor

@@ -1,0 +1,51 @@
+# WSF_COMM_TRANSCEIVER 通信收发器模板
+#
+# 用途：平台间通信，支持内部链路和全局网络
+# 验证来源：../Afsim_demoslists/engage项目汇总.md line 26
+# 验证来源：../Afsim_demoslists/comm项目汇总.md
+
+# --- 基础内部链路通信 ---
+comm <COMM_NAME> WSF_COMM_TRANSCEIVER
+   internal_link <LINK_NAME>
+   # internal_link：将此通信设备连接到指定的处理器/传感器
+end_comm
+
+# --- 带发射机的通信收发器 ---
+comm <COMM_NAME> WSF_COMM_TRANSCEIVER
+   on
+   # 默认开启
+
+   internal_link <LINK_NAME>
+   # 连接到平台内的处理器
+
+   transmitter
+      frequency 100 mhz
+      # 工作频率
+
+      power 50 mw
+      # 发射功率
+
+      maximum_range 100 km
+      # 最大通信距离
+   end_transmitter
+
+   receiver
+      frequency 100 mhz
+      # 接收频率
+   end_receiver
+end_comm
+
+# --- 卫星通信（北斗/GPS/伽利略）---
+comm <COMM_NAME> <COMM_TYPE>
+   # COMM_TYPE 如：GALILEO_DOWNLINKE1_TX, GLONASS_DOWNLINKL1_TX 等
+
+   location -150 0 1000 mm
+   # 通信设备在卫星平台上的位置
+
+   on
+end_comm
+
+# --- radio receiver（纯接收）---
+comm <COMM_NAME> WSF_RADIO_RCVR
+   frequency 1200 mhz
+end_comm

@@ -1,0 +1,66 @@
+# antenna_pattern 天线方向图模板
+#
+# 用途：定义雷达/通信天线的增益方向图
+# 验证来源：../Afsim_demoslists/sensor_demos项目汇总.md line 31, 1370, 1494, 1790, 2054, 2309, 2607 等
+
+# --- 类型 1：常数值方向图（最简单）---
+antenna_pattern <PATTERN_NAME>
+   constant 0 db
+   # 各向同性增益（或固定 dB 值）
+end_antenna_pattern
+
+antenna_pattern <PATTERN_NAME>
+   constant 12 dB
+   # 固定增益
+end_antenna_pattern
+
+# --- 类型 2：圆形方向图（圆锥形波束）---
+antenna_pattern <PATTERN_NAME>
+   circular_pattern
+      beamwidth 5 deg
+      # 3dB 波束宽度
+      peak_gain 30 db
+      # 峰值增益
+   end_circular_pattern
+end_antenna_pattern
+
+# --- 类型 3：矩形方向图（矩形波束，方位+俯仰分别控制）---
+antenna_pattern <PATTERN_NAME>
+   rectangular_pattern
+      peak_gain 35 dB
+      # 峰值增益
+      minimum_gain -20 dB
+      # 旁瓣增益
+      azimuth_beamwidth 10 deg
+      # 方位 3dB 带宽
+      elevation_beamwidth 45 deg
+      # 俯仰 3dB 带宽
+   end_rectangular_pattern
+end_antenna_pattern
+
+# --- 类型 4：恒定方向图（固定波束宽度）---
+antenna_pattern <PATTERN_NAME>
+   constant_pattern
+      peak_gain 28 dB
+      azimuth_beamwidth 4 deg
+      elevation_beamwidth 10 deg
+   end_constant_pattern
+end_antenna_pattern
+
+# --- 类型 5：正弦方向图（用于全向天线）---
+antenna_pattern <PATTERN_NAME>
+   sine_pattern
+      peak_gain 0 dB
+      minimum_gain -20 db
+      azimuth_beamwidth 360 deg
+      elevation_beamwidth 45 deg
+   end_sine_pattern
+end_antenna_pattern
+
+# --- 类型 6：均匀方向图（全向）---
+antenna_pattern <PATTERN_NAME>
+   uniform_pattern
+      peak_gain 10 dB
+      beamwidth 360 deg
+   end_uniform_pattern
+end_antenna_pattern

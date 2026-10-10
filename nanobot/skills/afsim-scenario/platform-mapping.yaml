@@ -1,0 +1,319 @@
+# platform-mapping.yaml — COA platform_code → AFSIM 参数映射
+#
+# 用途: Agent 在 Step 2 中按 entity 的 platform_code 查表，
+#       获取 AFSIM platform_type 所需的全部参数。
+#
+# 字段说明:
+#   icon         — AFSIM 图标名称（Warlock 中显示）
+#   mover        — AFSIM mover 基类型
+#   category     — 功能分类（决定传感器/武器/处理器组合）
+#   side_default — 默认阵营（可被 COA entity 的 side 字段覆盖）
+#   speed        — 默认巡航速度
+#   altitude     — 默认巡航高度
+#   radar_signature — 雷达反射截面（如需要）
+#   default_sensors — 默认传感器列表（按 category 选取）
+#   default_weapons — 默认武器列表（可被 COA entity 的 weapons 字段覆盖）
+#   default_processors — 默认处理器列表
+#   notes        — 备注
+#
+# 扩展: 新增平台只需追加条目，Agent 自动加载。
+
+# ═══════════════════════════════════════════
+# 蓝方 (BLUE) — 空中平台
+# ═══════════════════════════════════════════
+
+KJ-500:
+  icon: E-3_AWACS
+  mover: WSF_AIR_MOVER
+  category: awacs
+  side_default: blue
+  speed: 450 kts
+  altitude: 35000 ft msl
+  radar_signature: null  # 预警机通常不定义自身 RCS
+  default_sensors:
+    - name: awacs_radar
+      type: WSF_GEOMETRIC_SENSOR
+      params:
+        frame_time: "10 sec"
+        maximum_range: "500 km"
+        reports_location: true
+        ignore_same_side: true
+    - name: link16_comm
+      type: WSF_COMM_TRANSCEIVER
+      params:
+        frequency: "1030 MHz"
+        maximum_range: "600 km"
+  default_processors:
+    - name: track_fusion
+      type: WSF_TRACK_PROCESSOR
+  notes: "空警-500 预警指挥机，核心指控节点"
+
+J-16D:
+  icon: Su-30
+  mover: WSF_AIR_MOVER
+  category: ew
+  side_default: blue
+  speed: 550 kts
+  altitude: 30000 ft msl
+  radar_signature:
+    type: WSF_RADAR_SIGNATURE
+    constant: "5 m^2"
+  default_sensors:
+    - name: esm_sensor
+      type: WSF_ESM_SENSOR
+      params:
+        frame_time: "1 sec"
+        receive_only: true
+        reports_bearing: true
+        reports_location: true
+    - name: ew_jammer
+      type: WSF_GEOMETRIC_SENSOR
+      params:
+        transmit_only: true
+        maximum_range: "400 km"
+  default_weapons:
+    - name: pl_15
+      type: bvraam
+      quantity: 2
+  notes: "歼-16D 电子战机，频率隔离干扰主力"
+
+J-20:
+  icon: F-22
+  mover: WSF_AIR_MOVER
+  category: fighter
+  side_default: blue
+  speed: 600 kts
+  altitude: 40000 ft msl
+  radar_signature:
+    type: WSF_RADAR_SIGNATURE
+    constant: "0.01 m^2"  # 隐身构型
+  default_sensors:
+    - name: fighter_radar
+      type: WSF_GEOMETRIC_SENSOR
+      params:
+        frame_time: "2 sec"
+        maximum_range: "200 km"
+        reports_location: true
+        ignore_same_side: true
+  default_weapons:
+    - name: pl_15
+      type: bvraam
+      quantity: 6
+    - name: pl_10
+      type: wvraam
+      quantity: 2
+  notes: "歼-20 隐身战斗机，雷达静默战术"
+
+J-16:
+  icon: Su-30
+  mover: WSF_AIR_MOVER
+  category: strike
+  side_default: blue
+  speed: 550 kts
+  altitude: 30000 ft msl
+  radar_signature:
+    type: WSF_RADAR_SIGNATURE
+    constant: "5 m^2"
+  default_sensors:
+    - name: strike_radar
+      type: WSF_GEOMETRIC_SENSOR
+      params:
+        frame_time: "5 sec"
+        maximum_range: "150 km"
+        reports_location: true
+        ignore_same_side: true
+  default_weapons:
+    - name: yj_91
+      type: anti_radiation_missile
+      quantity: 4
+    - name: pl_15
+      type: bvraam
+      quantity: 4
+  notes: "歼-16 多用途战斗机，SEAD 主攻"
+
+J-16_BOMB:
+  icon: Su-30
+  mover: WSF_AIR_MOVER
+  category: strike_bomb
+  side_default: blue
+  speed: 550 kts
+  altitude: 25000 ft msl
+  radar_signature:
+    type: WSF_RADAR_SIGNATURE
+    constant: "5 m^2"
+  default_weapons:
+    - name: guided_bomb
+      type: precision_guided_munition
+      quantity: 6
+    - name: pl_15
+      type: bvraam
+      quantity: 2
+    - name: pl_10
+      type: wvraam
+      quantity: 2
+  notes: "歼-16 精确打击构型（卫星/INS 制导炸弹）"
+
+YY-20:
+  icon: KC-135
+  mover: WSF_AIR_MOVER
+  category: tanker
+  side_default: blue
+  speed: 400 kts
+  altitude: 25000 ft msl
+  radar_signature:
+    type: WSF_RADAR_SIGNATURE
+    constant: "50 m^2"
+  default_sensors: []
+  default_weapons: []
+  notes: "运油-20 空中加油机"
+
+# ═══════════════════════════════════════════
+# 红方 (RED) — 防空系统
+# ═══════════════════════════════════════════
+
+S-400:
+  icon: SA-21_Launcher
+  mover: WSF_GROUND_MOVER
+  category: sam_long_range
+  side_default: red
+  speed: 0 kts
+  altitude: 0 ft msl
+  default_sensors:
+    - name: acquisition_radar
+      type: WSF_GEOMETRIC_SENSOR
+      params:
+        frame_time: "5 sec"
+        maximum_range: "400 km"
+        reports_location: true
+        ignore_same_side: true
+    - name: engagement_radar
+      type: WSF_GEOMETRIC_SENSOR
+      params:
+        frame_time: "1 sec"
+        maximum_range: "250 km"
+        reports_location: true
+        ignore_same_side: true
+  default_weapons:
+    - name: 48n6e3
+      type: long_range_sam
+      quantity: 4
+  default_processors:
+    - name: track_processor
+      type: WSF_TRACK_PROCESSOR
+  notes: "S-400 远程防空系统"
+
+HQ-22:
+  icon: SA-10_Launcher
+  mover: WSF_GROUND_MOVER
+  category: sam_medium_range
+  side_default: red
+  speed: 0 kts
+  altitude: 0 ft msl
+  default_sensors:
+    - name: hq22_radar
+      type: WSF_GEOMETRIC_SENSOR
+      params:
+        frame_time: "2 sec"
+        maximum_range: "170 km"
+        reports_location: true
+        ignore_same_side: true
+  default_weapons:
+    - name: hq22_missile
+      type: medium_range_sam
+      quantity: 6
+  notes: "红旗-22 中程防空系统"
+
+LR_RADAR:
+  icon: Radar_Site
+  mover: WSF_GROUND_MOVER
+  category: early_warning
+  side_default: red
+  speed: 0 kts
+  altitude: 0 ft msl
+  default_sensors:
+    - name: ew_radar
+      type: WSF_GEOMETRIC_SENSOR
+      params:
+        frame_time: "10 sec"
+        maximum_range: "600 km"
+        reports_location: true
+        ignore_same_side: true
+  notes: "远程预警雷达站"
+
+ANTI_STEALTH_RADAR:
+  icon: Radar_Site
+  mover: WSF_GROUND_MOVER
+  category: vhf_radar
+  side_default: red
+  speed: 0 kts
+  altitude: 0 ft msl
+  default_sensors:
+    - name: vhf_sensor
+      type: WSF_GEOMETRIC_SENSOR
+      params:
+        frame_time: "15 sec"
+        maximum_range: "350 km"
+        reports_location: true
+        ignore_same_side: true
+  notes: "米波反隐身雷达"
+
+Su-35:
+  icon: Su-35
+  mover: WSF_AIR_MOVER
+  category: fighter
+  side_default: red
+  speed: 600 kts
+  altitude: 35000 ft msl
+  radar_signature:
+    type: WSF_RADAR_SIGNATURE
+    constant: "5 m^2"
+  default_sensors:
+    - name: irbis_e_radar
+      type: WSF_GEOMETRIC_SENSOR
+      params:
+        frame_time: "2 sec"
+        maximum_range: "350 km"
+        reports_location: true
+        ignore_same_side: true
+  default_weapons:
+    - name: r77_1
+      type: bvraam
+      quantity: 6
+    - name: r73
+      type: wvraam
+      quantity: 4
+  notes: "Su-35 多用途战斗机"
+
+# ═══════════════════════════════════════════
+# 通用/模板平台（用于 COA 中未明确指定的平台）
+# ═══════════════════════════════════════════
+
+GENERIC_AIR:
+  icon: Generic_Aircraft
+  mover: WSF_AIR_MOVER
+  category: generic_air
+  side_default: blue
+  speed: 500 kts
+  altitude: 30000 ft msl
+  radar_signature:
+    type: WSF_RADAR_SIGNATURE
+    constant: "5 m^2"
+  notes: "通用空中平台"
+
+GENERIC_GROUND:
+  icon: Generic_Vehicle
+  mover: WSF_GROUND_MOVER
+  category: generic_ground
+  side_default: red
+  speed: 0 kts
+  altitude: 0 ft msl
+  notes: "通用地面平台"
+
+GENERIC_SURFACE:
+  icon: Generic_Ship
+  mover: WSF_SURFACE_MOVER
+  category: generic_surface
+  side_default: blue
+  speed: 20 kts
+  altitude: 0 ft msl
+  notes: "通用水面平台"

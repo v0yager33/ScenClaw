@@ -1,0 +1,16 @@
+# WSF_TRACK_PROCESSOR 航迹处理器模板
+#
+# 用途：接收传感器数据并生成/维护航迹
+# 验证来源：../Afsim_demoslists/engage项目汇总.md line 67
+
+processor <PROCESSOR_NAME> WSF_TRACK_PROCESSOR
+   on
+   # 默认开启
+end_processor
+
+# --- 带输出配置的航迹处理器 ---
+processor <PROCESSOR_NAME> WSF_TRACK_PROCESSOR
+   on
+   report_interval 1 sec
+   # 航迹报告间隔
+end_processor

@@ -55,6 +55,7 @@ If a local `nanobot agent` session can already answer normally, you can also ask
 | Run several isolated bots | [`multiple-instances.md`](./multiple-instances.md) | Separate configs, workspaces, ports, and sessions |
 | Deploy outside a terminal | [`deployment.md`](./deployment.md) | Docker, systemd user services, and macOS LaunchAgent setup |
 | Join agent communities | [`agent-social-network.md`](./agent-social-network.md) | External agent-community setup |
+| Generate AFSIM scenarios from natural language or COA | [`afsim-scenario-agent.md`](./afsim-scenario-agent.md) | A runnable multi-file AFSIM project with validator score and repair trace |
 
 ## Reference
 
