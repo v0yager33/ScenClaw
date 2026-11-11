@@ -617,28 +617,21 @@ def normalize_ir_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], list[
     return result, notes
 
 
-def _sync_revised_intents(base: dict[str, Any], revised: dict[str, Any]) -> list[str]:
-    """修订后意图和物理平台对不上时, 以物理平台为准原地同步 mission.platforms, 返回说明。
+def _sync_intents(payload: dict[str, Any]) -> list[str]:
+    """意图和物理平台对不上时, 以物理平台为准原地同步 mission.platforms, 返回说明。
 
-    实测: refine 补丁给 platforms[].route 补了航点, 没动 mission.platforms[].route, 交付的
-    IR 里意图航路比编译出的航路少一个点; 另一次补丁把意图和航路一起重写, 意图里的初始
-    经度抄成了 121.31 (物理平台是 121.32)。编译和核验都按物理平台, 所以只要上一版两者
-    一致、这一版对不上, 就把意图同步成物理平台; 上一版本来就不一致, 说明模型另有打算,
-    不替它决定。
+    编译和核验都只看物理平台, 两处不一致的 IR 自相矛盾。实测: refine 补丁给
+    platforms[].route 补了航点, 没动 mission.platforms[].route; 另一次补丁把意图和航路
+    一起重写, 意图里的初始经度抄成了 121.31 (物理平台是 121.32)。原先只在上一版两者一致
+    时才同步, rerun 里 repair 把 24 架的意图航路都缩写成一个点, 下一版补全航路时漏改了
+    4 架挪过的初始位置, 因为上一版本来就不一致, 交付的 IR 里这 4 架就对不上了。
     """
-    old_platforms = _entries_by_id(base.get("platforms"))
-    old_intents = _entries_by_id(_mission_platforms(base))
-    intents = _entries_by_id(_mission_platforms(revised))
+    intents = _entries_by_id(_mission_platforms(payload))
     synced: list[str] = []
-    for platform_id, platform in _entries_by_id(revised.get("platforms")).items():
-        old_platform = old_platforms.get(platform_id)
-        old_intent, intent = old_intents.get(platform_id), intents.get(platform_id)
-        if old_platform is None or old_intent is None or intent is None:
-            continue
-        before, after = _platform_track(old_platform), _platform_track(platform)
-        if before is None or after is None or _intent_track(old_intent) != before:
-            continue
-        if _intent_track(intent) == after:
+    for platform_id, platform in _entries_by_id(payload.get("platforms")).items():
+        intent = intents.get(platform_id)
+        track = _platform_track(platform)
+        if intent is None or track is None or _intent_track(intent) == track:
             continue
         intent["initial_position"] = copy.deepcopy(platform["position"])
         intent["route"] = [copy.deepcopy(point["position"]) for point in platform.get("route") or []]
@@ -646,7 +639,7 @@ def _sync_revised_intents(base: dict[str, Any], revised: dict[str, Any]) -> list
     if not synced:
         return []
     return [
-        f"修订后 {'、'.join(synced)} 的意图和物理位置或航路对不上, "
+        f"{'、'.join(synced)} 的意图和物理位置或航路对不上, "
         "已按 platforms[] 同步到 mission.platforms 里的意图"
     ]
 
@@ -1473,13 +1466,11 @@ class ScenarioIRPlanner:
             if patch_errors:
                 scenario, afsim_code, errors, normalizations = None, "", patch_errors, []
             else:
-                # 修订后意图和物理航路对不上时以物理平台为准, 否则交付的 IR 里两处航路不一致
-                synced = (
-                    _sync_revised_intents(patch_base, payload) if patch_base is not None else []
-                )
                 # 先做确定性归一化: 答案唯一的机械问题不必浪费修复轮次
                 payload, normalizations = normalize_ir_payload(payload)
-                normalizations = [*synced, *normalizations]
+                # 意图和物理航路对不上时以物理平台为准, 否则交付的 IR 里两处航路不一致;
+                # 放在归一化之后, 归一化改过的物理平台 (如固定设施去掉航路) 也一并同步
+                normalizations = [*normalizations, *_sync_intents(payload)]
                 scenario, afsim_code, errors = self._validate_and_compile(payload)
             if scenario is None:
                 attempts.append(PlanAttempt(round_index, stage, False, errors, patched=patched))

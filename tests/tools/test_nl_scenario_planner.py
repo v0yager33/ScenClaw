@@ -1524,10 +1524,9 @@ _EXTRA_LEG = {
 
 
 def test_revised_route_is_synced_into_the_intent() -> None:
-    base = _synced_ir()
-    revised = copy.deepcopy(base)
+    revised = _synced_ir()
     revised["platforms"][0]["route"].append(_EXTRA_LEG)
-    notes = planner_module._sync_revised_intents(base, revised)
+    notes = planner_module._sync_intents(revised)
 
     assert revised["mission"]["platforms"][0]["route"] == [
         point["position"] for point in revised["platforms"][0]["route"]
@@ -1535,34 +1534,60 @@ def test_revised_route_is_synced_into_the_intent() -> None:
     assert len(notes) == 1 and "blue_awacs" in notes[0]
 
 
-def test_intent_is_left_alone_when_it_already_differed() -> None:
-    """上一版本来就不一致: 说明模型另有打算, 不替它决定。"""
-    base = _valid_ir()
-    revised = copy.deepcopy(base)
-    revised["platforms"][0]["route"].append(_EXTRA_LEG)
-    expected = copy.deepcopy(revised["mission"]["platforms"])
+def test_consistent_intents_are_left_alone() -> None:
+    ir = _synced_ir()
+    expected = copy.deepcopy(ir)
 
-    assert planner_module._sync_revised_intents(base, revised) == []
-    assert revised["mission"]["platforms"] == expected
+    assert planner_module._sync_intents(ir) == []
+    assert ir == expected
+
+
+def test_intent_is_synced_even_when_it_already_differed() -> None:
+    """rerun 实测: repair 把意图航路缩写成一个点, 下一版补全航路时漏改了挪过的初始位置。
+
+    原先只在上一版两者一致时才同步, 这一版就漏了, 交付的 IR 里意图起点和物理平台对不上。
+    """
+    ir = _valid_ir()  # blue_awacs 的意图没写航路
+    platform = ir["platforms"][0]
+    platform["route"].append(_EXTRA_LEG)
+    platform["position"] = {**platform["position"], "longitude_deg": 120.8}
+    notes = planner_module._sync_intents(ir)
+
+    intent = ir["mission"]["platforms"][0]
+    assert intent["initial_position"] == platform["position"]
+    assert intent["route"] == [point["position"] for point in platform["route"]]
+    assert len(notes) == 1 and "blue_awacs" in notes[0]
 
 
 @pytest.mark.parametrize("move_platform", [True, False])
 def test_intent_copy_errors_are_overwritten_by_the_platform(move_platform: bool) -> None:
     """rerun 实测: 补丁把意图和航路一起重写, 意图里的初始经度抄错了 0.01°。"""
-    base = _synced_ir()
-    revised = copy.deepcopy(base)
+    revised = _synced_ir()
     intent = revised["mission"]["platforms"][0]
     if move_platform:
         revised["platforms"][0]["route"].append(_EXTRA_LEG)
         intent["route"] = [*intent["route"], dict(_EXTRA_LEG["position"])]
     start = intent["initial_position"]
     intent["initial_position"] = {**start, "longitude_deg": start["longitude_deg"] + 0.01}
-    notes = planner_module._sync_revised_intents(base, revised)
+    notes = planner_module._sync_intents(revised)
 
     platform = revised["platforms"][0]
     assert intent["initial_position"] == platform["position"]
     assert intent["route"] == [point["position"] for point in platform["route"]]
     assert len(notes) == 1 and "blue_awacs" in notes[0]
+
+
+def test_extracted_intents_follow_the_platforms() -> None:
+    """首版 IR 的意图和物理平台对不上时同样以物理平台为准。"""
+    ir = _synced_ir()
+    intent = ir["mission"]["platforms"][1]
+    intent["initial_position"] = {**intent["initial_position"], "latitude_deg": 27.6}
+    result = ScenarioIRPlanner(llm=ScriptedLLM([_dumps(ir)])).plan("任务")
+
+    assert result.success and result.rounds == 1
+    synced = result.scenario_ir["mission"]["platforms"][1]
+    assert synced["initial_position"] == ir["platforms"][1]["position"]
+    assert any("red_radar" in note for note in result.normalizations)
 
 
 def test_patched_route_keeps_the_intent_in_step() -> None:
