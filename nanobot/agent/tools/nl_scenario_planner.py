@@ -240,6 +240,8 @@ _IMPLICIT_ENGAGEMENT_RULES = """
 - 被击毁的平台此后的航点都不会飞到: 需求要求某平台在某时刻之后完成的航段
   (穿越、抵达、撤离等), 它必须活到那时。射击计划决定了谁在何时被毁, 不要为了
   "每发都打得出"把承担这类航段的平台提前打掉;
+- 需求给了阶段时间线时, 射击要落实到阶段的性质上: 写明争夺、拦截、压制等交火内容的
+  阶段要安排射击 (比如由掩护编队先打掉威胁), 不要为了避开时序冲突把射击整体推到后面的阶段;
 - 掩护、压制可以写成己方抢先摧毁威胁: 对方针对被掩护平台的射击因射手已被击毁
   而打不出, 这是合理的战术结果;
 - 每个目标只安排一次有效射击, 不要再打已被摧毁的平台;
@@ -276,7 +278,8 @@ _PATCH_LIST_IDS: dict[tuple[str, ...], str] = {
 _PATCH_FORMAT = f"""输出格式: 上一版 IR 就在对话里, 只输出改动的补丁 {{"{_PATCH_KEY}": {{...}}}}, 不要整份重抄 (整份重抄常超出输出预算被截断); 代码会把补丁合并到上一版再完整校验。补丁的合并规则:
 - 对象按键合并, 只写要改的键; 值写 null 表示删掉这个键;
 - platforms、mission.platforms、engagements、assertions、sensors 和 platforms[].weapons 按 id (platform_id、engagement_id、assertion_id、sensor_type_id、instance_name) 合并: 只列要改的元素, 没列出的保持原样; 新 id 追加到末尾; 元素里写 "{_DELETE_MARK}": true 表示删除它;
-- 其余列表 (route、platforms[].sensors、assumptions、rationale、assignments 等) 整体替换, 要写出改后的完整列表。
+- 其余列表 (route、platforms[].sensors、assumptions、rationale、assignments 等) 整体替换, 要写出改后的完整列表;
+- 嵌套字段写在所属对象里, 比如 mission.platforms 写成 {{"mission": {{"platforms": [...]}}}}, 不要写成顶层键 mission_platforms。
 示例: {{"{_PATCH_KEY}": {{"engagements": [{{"engagement_id": "e1", "fire_time_s": 900.0}}, {{"engagement_id": "e2", "{_DELETE_MARK}": true}}], "platforms": [{{"platform_id": "red_f1", "route": [...]}}]}}}}"""
 
 _REVISION_NUDGE = (
@@ -615,11 +618,13 @@ def normalize_ir_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], list[
 
 
 def _sync_revised_intents(base: dict[str, Any], revised: dict[str, Any]) -> list[str]:
-    """修订只改了物理平台的位置或航路时, 原地同步 mission.platforms 里的意图, 返回说明。
+    """修订后意图和物理平台对不上时, 以物理平台为准原地同步 mission.platforms, 返回说明。
 
     实测: refine 补丁给 platforms[].route 补了航点, 没动 mission.platforms[].route, 交付的
-    IR 里意图航路比编译出的航路少一个点。只在上一版两者一致、这一版意图没改时同步;
-    上一版本来就不一致, 或这一版意图也改了, 说明模型另有打算, 不替它决定。
+    IR 里意图航路比编译出的航路少一个点; 另一次补丁把意图和航路一起重写, 意图里的初始
+    经度抄成了 121.31 (物理平台是 121.32)。编译和核验都按物理平台, 所以只要上一版两者
+    一致、这一版对不上, 就把意图同步成物理平台; 上一版本来就不一致, 说明模型另有打算,
+    不替它决定。
     """
     old_platforms = _entries_by_id(base.get("platforms"))
     old_intents = _entries_by_id(_mission_platforms(base))
@@ -631,16 +636,19 @@ def _sync_revised_intents(base: dict[str, Any], revised: dict[str, Any]) -> list
         if old_platform is None or old_intent is None or intent is None:
             continue
         before, after = _platform_track(old_platform), _platform_track(platform)
-        if before is None or after is None or after == before:
+        if before is None or after is None or _intent_track(old_intent) != before:
             continue
-        if _intent_track(old_intent) != before or _intent_track(intent) != before:
+        if _intent_track(intent) == after:
             continue
         intent["initial_position"] = copy.deepcopy(platform["position"])
         intent["route"] = [copy.deepcopy(point["position"]) for point in platform.get("route") or []]
         synced.append(platform_id)
     if not synced:
         return []
-    return [f"修订只改了 {'、'.join(synced)} 的物理位置或航路, 已同步到 mission.platforms 里的意图"]
+    return [
+        f"修订后 {'、'.join(synced)} 的意图和物理位置或航路对不上, "
+        "已按 platforms[] 同步到 mission.platforms 里的意图"
+    ]
 
 
 def _mission_platforms(payload: dict[str, Any]) -> Any:
@@ -1408,6 +1416,10 @@ class ScenarioIRPlanner:
                     if best is None and stage == "extract" and not extract_retried:
                         extract_retried = True
                         round_budget += 1
+                    elif best is not None:
+                        # 修订轮的这一次重问也不占轮数: 实测 refine 推理耗尽占掉一轮,
+                        # 末轮补丁又因 schema 小错作废, 42 条问题最后只修掉 3 条
+                        round_budget += 1
                     if nudge not in request_message:
                         conversation = [
                             *conversation[:-1],
@@ -1461,7 +1473,7 @@ class ScenarioIRPlanner:
             if patch_errors:
                 scenario, afsim_code, errors, normalizations = None, "", patch_errors, []
             else:
-                # 修订只改了物理航路时把意图跟上, 否则交付的 IR 里两处航路对不上
+                # 修订后意图和物理航路对不上时以物理平台为准, 否则交付的 IR 里两处航路不一致
                 synced = (
                     _sync_revised_intents(patch_base, payload) if patch_base is not None else []
                 )
@@ -1477,6 +1489,8 @@ class ScenarioIRPlanner:
                     if salvaged:
                         break
                     salvaged = True
+                    # 轮数用完时也补这一次: 末轮修订往往改得最多, 不能因一处 schema 小错整轮作废
+                    round_budget = max(round_budget, round_index + 1)
                 patch_base = payload
                 # 回灌完整 IR: 截断后模型看不到自己的上一版, "只改报错处"无从谈起
                 conversation = [
@@ -1920,8 +1934,36 @@ def apply_ir_patch(
     if not isinstance(patch, dict):
         return None, [f"{_PATCH_KEY} 的值应该是对象, 实际是 {type(patch).__name__}"]
     errors: list[str] = []
+    patch = _fold_path_keys(patch, errors)
     merged = _merge_fields(copy.deepcopy(base), patch, (), errors)
     return (None, errors) if errors else (merged, [])
+
+
+def _fold_path_keys(patch: dict[str, Any], errors: list[str]) -> dict[str, Any]:
+    """把写成顶层键的嵌套列表 (``mission_platforms``、``"mission.platforms"``) 折回原位。
+
+    实测: 合并规则里提到 mission.platforms, 模型在补丁顶层写了 mission_platforms, 合并后
+    多出的字段被 schema 拒掉, 末轮修订整份作废; 按原位合并时问题从 42 条降到 10 条。
+    """
+    folded = dict(patch)
+    for path in _PATCH_LIST_IDS:
+        # 父级本身是按 id 合并的列表 (platforms[].weapons) 时没有唯一的位置可折
+        if len(path) != 2 or path[:1] in _PATCH_LIST_IDS:
+            continue
+        parent, child = path
+        for alias in (f"{parent}.{child}", f"{parent}_{child}"):
+            if alias not in folded:
+                continue
+            value = folded.pop(alias)
+            holder = folded.get(parent, {})
+            if not isinstance(holder, dict) or child in holder:
+                errors.append(
+                    f"补丁里的 {alias} 应写成 {{\"{parent}\": {{\"{child}\": [...]}}}},"
+                    f" 而 {parent} 里已经另有 {child}, 无法确定以哪个为准"
+                )
+                continue
+            folded[parent] = {**holder, child: value}
+    return folded
 
 
 def _merge_fields(

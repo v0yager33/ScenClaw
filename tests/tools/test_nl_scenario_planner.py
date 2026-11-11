@@ -1210,6 +1210,34 @@ def test_ambiguous_patch_is_rejected_whole(patch: Any, message: str) -> None:
     assert any(message in error for error in errors)
 
 
+@pytest.mark.parametrize("alias", ["mission_platforms", "mission.platforms"])
+def test_patch_folds_nested_list_keys_written_at_the_top(alias: str) -> None:
+    """rerun 实测: 模型把合并规则里的 mission.platforms 写成补丁顶层键 mission_platforms。"""
+    base = _valid_ir()
+    merged, errors = planner_module.apply_ir_patch(base, {
+        "mission": {"objective": "压制红方雷达"},
+        alias: [{"platform_id": "red_radar", "type_hint": "制导雷达阵地"}],
+    })
+
+    assert errors == []
+    assert alias not in merged
+    assert merged["mission"]["objective"] == "压制红方雷达"
+    assert merged["mission"]["platforms"][1] == {
+        **base["mission"]["platforms"][1], "type_hint": "制导雷达阵地",
+    }
+    assert merged["mission"]["platforms"][0] == base["mission"]["platforms"][0]
+
+
+def test_patch_with_both_nested_list_spellings_is_rejected() -> None:
+    merged, errors = planner_module.apply_ir_patch(_valid_ir(), {
+        "mission": {"platforms": []},
+        "mission_platforms": [{"platform_id": "red_radar", "type_hint": "制导雷达阵地"}],
+    })
+
+    assert merged is None
+    assert any("mission_platforms" in error and "无法确定" in error for error in errors)
+
+
 def test_refine_patch_is_merged_onto_the_previous_version() -> None:
     llm = ScriptedLLM([_dumps(_overlapping_ir()), _patch(_restore_red_radar())])
     result = ScenarioIRPlanner(llm=llm, max_repair_rounds=2).plan("任务")
@@ -1380,6 +1408,33 @@ def test_extract_thought_out_retry_does_not_use_up_a_repair_round() -> None:
     assert [a.stage for a in result.attempts] == ["extract", "extract", "refine"]
 
 
+def test_revision_thought_out_retry_does_not_use_up_a_repair_round() -> None:
+    """rerun 实测: refine 推理耗尽占掉一轮, 42 条问题最后只修掉 3 条。"""
+    llm = FinishReasonLLM(
+        [(_dumps(_overlapping_ir()), "stop"), (_PARTIAL_REPLY, "length"),
+         (_patch(_restore_red_radar()), "stop")],
+        usages=[None, _THOUGHT_OUT_USAGE, None],
+    )
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=2).plan("任务")
+
+    assert result.success and result.advisories == []
+    assert [a.stage for a in result.attempts] == ["extract", "refine", "refine"]
+
+
+def test_schema_slip_in_the_last_revision_is_still_repaired() -> None:
+    """末轮补丁多写一个顶层键被 schema 拒掉时仍补一次 repair, 不把这一轮的修改丢掉。"""
+    llm = ScriptedLLM([
+        _dumps(_overlapping_ir()),
+        _patch({**_restore_red_radar(), "notes": "挪回雷达"}),
+        _patch({"notes": None}),
+    ])
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=2).plan("任务")
+
+    assert result.success and result.advisories == []
+    assert [a.stage for a in result.attempts] == ["extract", "refine", "repair"]
+    assert "notes" not in result.scenario_ir
+
+
 async def test_tools_enable_requirement_checks_by_default(monkeypatch) -> None:
     seen: list[bool] = []
     result = ScenarioIRPlanner(llm=ScriptedLLM([_dumps(_valid_ir())])).plan("任务")
@@ -1480,18 +1535,34 @@ def test_revised_route_is_synced_into_the_intent() -> None:
     assert len(notes) == 1 and "blue_awacs" in notes[0]
 
 
-@pytest.mark.parametrize("edit_intent", [False, True])
-def test_intent_is_left_alone_when_the_model_meant_it(edit_intent: bool) -> None:
-    """上一版本来就不一致, 或这一版意图也改了: 不替模型决定。"""
-    base = _synced_ir() if edit_intent else _valid_ir()
+def test_intent_is_left_alone_when_it_already_differed() -> None:
+    """上一版本来就不一致: 说明模型另有打算, 不替它决定。"""
+    base = _valid_ir()
     revised = copy.deepcopy(base)
     revised["platforms"][0]["route"].append(_EXTRA_LEG)
-    if edit_intent:
-        revised["mission"]["platforms"][0]["route"] = []
     expected = copy.deepcopy(revised["mission"]["platforms"])
 
     assert planner_module._sync_revised_intents(base, revised) == []
     assert revised["mission"]["platforms"] == expected
+
+
+@pytest.mark.parametrize("move_platform", [True, False])
+def test_intent_copy_errors_are_overwritten_by_the_platform(move_platform: bool) -> None:
+    """rerun 实测: 补丁把意图和航路一起重写, 意图里的初始经度抄错了 0.01°。"""
+    base = _synced_ir()
+    revised = copy.deepcopy(base)
+    intent = revised["mission"]["platforms"][0]
+    if move_platform:
+        revised["platforms"][0]["route"].append(_EXTRA_LEG)
+        intent["route"] = [*intent["route"], dict(_EXTRA_LEG["position"])]
+    start = intent["initial_position"]
+    intent["initial_position"] = {**start, "longitude_deg": start["longitude_deg"] + 0.01}
+    notes = planner_module._sync_revised_intents(base, revised)
+
+    platform = revised["platforms"][0]
+    assert intent["initial_position"] == platform["position"]
+    assert intent["route"] == [point["position"] for point in platform["route"]]
+    assert len(notes) == 1 and "blue_awacs" in notes[0]
 
 
 def test_patched_route_keeps_the_intent_in_step() -> None:

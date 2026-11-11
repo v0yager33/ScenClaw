@@ -100,6 +100,21 @@ class RequirementCheck:
         return data
 
 
+@dataclass(frozen=True)
+class _Plan:
+    """核验时共享的推演结果。
+
+    ``destroyed`` 是按射击计划推演出的毁伤; ``fire_windows`` 和 ``survive_until`` 来自别的
+    条款 (射手限定的开火时段、平台须存活到的进区时刻), 用来在报文里点明两条需求互相牵制。
+    实测: 预备队的射击要挪进 540-900 s, 打的却是要在约 907 s 进走廊时仍存活的蓝一; 两条
+    报文各说各的, 模型在"挪进时段"和"推迟射击"之间来回改, 两轮都没想到换目标。
+    """
+
+    destroyed: dict[str, tuple[float, str]]
+    fire_windows: dict[str, tuple[float | None, float | None]] = field(default_factory=dict)
+    survive_until: dict[str, float] = field(default_factory=dict)
+
+
 # ═══════════════════════════════════════════════════════
 # 解析
 # ═══════════════════════════════════════════════════════
@@ -286,12 +301,32 @@ def evaluate_requirement_checks(
     ``destroyed`` 是按射击计划推演出的毁伤 ``{platform_id: (时刻, 交战 id)}``:
     被毁平台之后的射击和航段都不会发生。
     """
-    destroyed = destroyed or {}
+    plan = _plan(scenario, checks, destroyed or {})
     issues: list[str] = []
     for check in checks:
         prefix = _prefix(check)
-        issues.extend(prefix + message for message in _evaluate(scenario, check, destroyed))
+        issues.extend(prefix + message for message in _evaluate(scenario, check, plan))
     return issues
+
+
+def _plan(
+    scenario: ScenarioIR, checks: list[RequirementCheck], destroyed: dict[str, tuple[float, str]]
+) -> _Plan:
+    fire_windows: dict[str, tuple[float | None, float | None]] = {}
+    survive_until: dict[str, float] = {}
+    for check in checks:
+        params = check.params
+        if check.kind == "fire_window":
+            for platform in _resolve(params.get("shooters"), scenario)[0]:
+                window = (params.get("start_s"), params.get("end_s"))
+                fire_windows.setdefault(platform.platform_id, window)
+        elif check.kind == "reach_area" and params.get("alive", True):
+            for platform in _resolve(params.get("platforms"), scenario)[0]:
+                entry = _first_entry(platform, params, scenario.mission.duration_s)
+                if entry is not None and entry[0] is not None:
+                    pid = platform.platform_id
+                    survive_until[pid] = max(survive_until.get(pid, 0.0), entry[0])
+    return _Plan(destroyed, fire_windows, survive_until)
 
 
 def describe_requirement_check(check: RequirementCheck) -> str:
@@ -306,9 +341,7 @@ def _prefix(check: RequirementCheck) -> str:
     return f"需求条款 {check.kind} 未满足: "
 
 
-def _evaluate(
-    scenario: ScenarioIR, check: RequirementCheck, destroyed: dict[str, tuple[float, str]]
-) -> list[str]:
+def _evaluate(scenario: ScenarioIR, check: RequirementCheck, plan: _Plan) -> list[str]:
     params = check.params
     messages: list[str] = []
     selector_field = next(
@@ -322,11 +355,11 @@ def _evaluate(
         if not platforms:
             return messages
     evaluator = _EVALUATORS[check.kind]
-    messages.extend(evaluator(scenario, params, platforms, destroyed))
+    messages.extend(evaluator(scenario, params, platforms, plan))
     return messages
 
 
-def _side_separation(scenario, params, _platforms, _destroyed) -> list[str]:
+def _side_separation(scenario, params, _platforms, _plan) -> list[str]:
     blues = [p for p in scenario.platforms if p.side.value == "blue"]
     reds = [p for p in scenario.platforms if p.side.value == "red"]
     if not blues or not reds:
@@ -350,7 +383,7 @@ def _side_separation(scenario, params, _platforms, _destroyed) -> list[str]:
     return [f"{head}; 需把双方相向移近{move}, 航路随初始位置一起平移"]
 
 
-def _formation_spacing(scenario, params, _platforms, _destroyed) -> list[str]:
+def _formation_spacing(scenario, params, _platforms, _plan) -> list[str]:
     low, high = params.get("min_km"), params.get("max_km")
     groups: list[list[PlatformIR]] = []
     missing: list[str] = []
@@ -380,7 +413,7 @@ def _formation_spacing(scenario, params, _platforms, _destroyed) -> list[str]:
     return messages
 
 
-def _fire_window(scenario, params, platforms, _destroyed) -> list[str]:
+def _fire_window(scenario, params, platforms, plan) -> list[str]:
     start, end = params.get("start_s"), params.get("end_s")
     shooters = {p.platform_id for p in platforms}
     shots = [e for e in scenario.engagements if e.shooter_platform in shooters]
@@ -389,13 +422,34 @@ def _fire_window(scenario, params, platforms, _destroyed) -> list[str]:
         return [f"{', '.join(sorted(shooters))} 没有任何射击计划, 需求要求它们在 {window} 开火"]
     return [
         f"交战 {e.engagement_id} ({e.shooter_platform}) 在 {e.fire_time_s:g}s 开火, "
-        f"不在要求的 {window} 内; 请把开火时刻调进该时段"
+        f"不在要求的 {window} 内; " + _into_window_advice(e, start, end, plan)
         for e in sorted(shots, key=lambda e: e.fire_time_s)
         if not _within(e.fire_time_s, start, end)
     ]
 
 
-def _fire_phases(scenario, params, platforms, destroyed) -> list[str]:
+def _into_window_advice(
+    engagement: ScheduledEngagementIR, start: float | None, end: float | None, plan: _Plan
+) -> str:
+    """把射击调进时段的建议; 调进去会提前击毁需求要求存活的目标时, 改为建议换目标。"""
+    target = engagement.target_platform
+    until = plan.survive_until.get(target)
+    if until is None or (start is not None and until <= start):
+        return "请把开火时刻调进该时段"
+    if end is not None and until >= end:
+        return (
+            f"但目标 {target} 按需求要在约 {until:.0f}s 进区时仍存活, 时段内开火会提前击毁它;"
+            f" 请改打别的目标, 再把开火时刻调进该时段"
+        )
+    later = f"{until:.0f}s 之后" if end is None else f"{until:.0f}-{end:g}s"
+    return (
+        f"目标 {target} 按需求要在约 {until:.0f}s 进区时仍存活, 请把开火时刻调进 {later},"
+        f" 或改打别的目标"
+    )
+
+
+def _fire_phases(scenario, params, platforms, plan) -> list[str]:
+    destroyed = plan.destroyed
     windows: list[list[float]] = params["windows"]
     shooters = {p.platform_id for p in platforms}
     times = sorted(
@@ -417,7 +471,8 @@ def _fire_phases(scenario, params, platforms, destroyed) -> list[str]:
     ]
 
 
-def _engagement_range(scenario, params, platforms, destroyed) -> list[str]:
+def _engagement_range(scenario, params, platforms, plan) -> list[str]:
+    destroyed = plan.destroyed
     low, high = params.get("min_km"), params.get("max_km")
     shooters = {p.platform_id for p in platforms}
     by_id = {p.platform_id: p for p in scenario.platforms}
@@ -484,7 +539,7 @@ def _engagement_range(scenario, params, platforms, destroyed) -> list[str]:
     return messages
 
 
-def _reach_area(scenario, params, platforms, destroyed) -> list[str]:
+def _reach_area(scenario, params, platforms, plan) -> list[str]:
     start, end = params.get("start_s"), params.get("end_s")
     must_survive = params.get("alive", True)
     area = _area_text(params)
@@ -501,23 +556,36 @@ def _reach_area(scenario, params, platforms, destroyed) -> list[str]:
             )
             continue
         problems: list[str] = []
-        killed = destroyed.get(pid)
+        killed = plan.destroyed.get(pid)
         if must_survive and killed is not None and killed[0] <= entered_at:
             problems.append(
                 f"它在 {killed[0]:g}s 被交战 {killed[1]} 摧毁, 早于进区时刻, 而需求要求进区时仍存活;"
-                f" 请推迟或改掉这次射击, 或让它更早进区"
+                + _spare_advice(scenario, killed[1], pid, entered_at, plan)
             )
         if not _within(entered_at, start, end):
             problems.append(_entry_timing_advice(platform, travelled_m, entered_at, start, end))
         if problems:
+            timing = "" if start is None and end is None else f", 要求 {_span(start, end, 's')}"
             messages.append(
-                f"{pid} 在约 {entered_at:.0f}s 首次进入要求区域 ({area}), 要求 {_span(start, end, 's')}: "
+                f"{pid} 在约 {entered_at:.0f}s 首次进入要求区域 ({area}){timing}: "
                 + "; ".join(problems)
             )
     return messages
 
 
-def _altitude_range(_scenario, params, platforms, _destroyed) -> list[str]:
+def _spare_advice(scenario, engagement_id: str, pid: str, entered_at: float, plan: _Plan) -> str:
+    """让平台活到进区的建议; 射手的开火时段被需求限死在进区之前时, 推迟射击行不通。"""
+    shot = next((e for e in scenario.engagements if e.engagement_id == engagement_id), None)
+    window = plan.fire_windows.get(shot.shooter_platform) if shot is not None else None
+    if window is None or window[1] is None or window[1] >= entered_at:
+        return " 请推迟或改掉这次射击, 或让它更早进区"
+    return (
+        f" 射手 {shot.shooter_platform} 按需求只能在 {_span(*window, 's')} 开火, 推迟到进区之后会出时段;"
+        f" 请让它改打别的目标, 或让 {pid} 更早进区"
+    )
+
+
+def _altitude_range(_scenario, params, platforms, _plan) -> list[str]:
     low, high = params.get("min_m"), params.get("max_m")
     messages = []
     for platform in platforms:
@@ -531,7 +599,7 @@ def _altitude_range(_scenario, params, platforms, _destroyed) -> list[str]:
     return messages
 
 
-def _speed_range(_scenario, params, platforms, _destroyed) -> list[str]:
+def _speed_range(_scenario, params, platforms, _plan) -> list[str]:
     low, high = params.get("min_mps"), params.get("max_mps")
     messages = []
     for platform in platforms:
@@ -546,7 +614,7 @@ def _speed_range(_scenario, params, platforms, _destroyed) -> list[str]:
     return messages
 
 
-def _route_points(scenario, params, platforms, _destroyed) -> list[str]:
+def _route_points(scenario, params, platforms, _plan) -> list[str]:
     need = params["min_count"]
     duration = scenario.mission.duration_s
     messages = []

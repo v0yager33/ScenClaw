@@ -338,6 +338,39 @@ def test_reach_area_suggests_an_entry_target_away_from_the_window_edges() -> Non
     assert len(late) == 1 and "进区前航程改到约 23 km 可在 90s 左右进区" in late[0]
 
 
+def test_fire_window_suggests_retargeting_a_target_that_must_survive() -> None:
+    """rerun 实测: 预备队射击要挪进 540-900 s, 打的却是要在约 907 s 进走廊时仍存活的蓝一。"""
+    scenario = _scenario([_shot("late", "red_1", "blue_1", 300.0)])
+    reach = _check("reach_area", platforms=["blue_1"], lon_min=121.5)  # 约 199 s 进区
+    held = evaluate_requirement_checks(
+        scenario, [_check("fire_window", shooters=["red_1"], start_s=100.0, end_s=150.0), reach]
+    )
+    split = evaluate_requirement_checks(
+        scenario, [_check("fire_window", shooters=["red_1"], start_s=100.0, end_s=250.0), reach]
+    )
+
+    assert len(held) == 1
+    assert "但目标 blue_1 按需求要在约 199s 进区时仍存活" in held[0]
+    assert "请改打别的目标, 再把开火时刻调进该时段" in held[0]
+    assert len(split) == 1 and "请把开火时刻调进 199-250s, 或改打别的目标" in split[0]
+
+
+def test_reach_area_suggests_retargeting_when_the_shooter_is_held_to_a_window() -> None:
+    """射手只能在进区之前开火时, 推迟射击行不通。"""
+    scenario = _scenario([_shot("early", "red_1", "blue_1", 120.0)])
+    reach = _check("reach_area", platforms=["blue_1"], lon_min=121.5)
+    window = _check("fire_window", shooters=["red_1"], start_s=100.0, end_s=150.0)
+    killed = {"blue_1": (120.0, "early")}
+    issues = evaluate_requirement_checks(scenario, [reach, window], killed)
+
+    assert len(issues) == 1
+    assert (
+        "射手 red_1 按需求只能在 100-150s 开火, 推迟到进区之后会出时段;"
+        " 请让它改打别的目标, 或让 blue_1 更早进区"
+    ) in issues[0]
+    assert "请推迟或改掉这次射击" in _issues(reach, scenario, killed)[0]
+
+
 def test_altitude_and_speed_limits_are_checked_per_point() -> None:
     altitude = _issues(_check("altitude_range", platforms=["side:red"], max_m=5000.0))
     speed = _issues(_check("speed_range", platforms=["blue_1"], max_mps=200.0))
