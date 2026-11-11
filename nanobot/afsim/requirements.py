@@ -108,11 +108,14 @@ class _Plan:
     条款 (射手限定的开火时段、平台须存活到的进区时刻), 用来在报文里点明两条需求互相牵制。
     实测: 预备队的射击要挪进 540-900 s, 打的却是要在约 907 s 进走廊时仍存活的蓝一; 两条
     报文各说各的, 模型在"挪进时段"和"推迟射击"之间来回改, 两轮都没想到换目标。
+    ``ranges`` 是射手须满足的开火斜距 ``(min_km, max_km)``: 包络只报时段外的部分时,
+    模型把预备队的两发挪到 950/960 s 进了包络, 却出了要求的 540-900 s。
     """
 
     destroyed: dict[str, tuple[float, str]]
     fire_windows: dict[str, tuple[float | None, float | None]] = field(default_factory=dict)
     survive_until: dict[str, float] = field(default_factory=dict)
+    ranges: dict[str, tuple[float | None, float | None]] = field(default_factory=dict)
 
 
 # ═══════════════════════════════════════════════════════
@@ -314,6 +317,7 @@ def _plan(
 ) -> _Plan:
     fire_windows: dict[str, tuple[float | None, float | None]] = {}
     survive_until: dict[str, float] = {}
+    ranges: dict[str, tuple[float | None, float | None]] = {}
     for check in checks:
         params = check.params
         if check.kind == "fire_window":
@@ -326,7 +330,11 @@ def _plan(
                 if entry is not None and entry[0] is not None:
                     pid = platform.platform_id
                     survive_until[pid] = max(survive_until.get(pid, 0.0), entry[0])
-    return _Plan(destroyed, fire_windows, survive_until)
+        elif check.kind == "engagement_range":
+            for platform in _resolve(params.get("shooters"), scenario)[0]:
+                limits = (params.get("min_km"), params.get("max_km"))
+                ranges.setdefault(platform.platform_id, limits)
+    return _Plan(destroyed, fire_windows, survive_until, ranges)
 
 
 def describe_requirement_check(check: RequirementCheck) -> str:
@@ -422,30 +430,60 @@ def _fire_window(scenario, params, platforms, plan) -> list[str]:
         return [f"{', '.join(sorted(shooters))} 没有任何射击计划, 需求要求它们在 {window} 开火"]
     return [
         f"交战 {e.engagement_id} ({e.shooter_platform}) 在 {e.fire_time_s:g}s 开火, "
-        f"不在要求的 {window} 内; " + _into_window_advice(e, start, end, plan)
+        f"不在要求的 {window} 内; " + _into_window_advice(scenario, e, start, end, plan)
         for e in sorted(shots, key=lambda e: e.fire_time_s)
         if not _within(e.fire_time_s, start, end)
     ]
 
 
 def _into_window_advice(
-    engagement: ScheduledEngagementIR, start: float | None, end: float | None, plan: _Plan
+    scenario: ScenarioIR,
+    engagement: ScheduledEngagementIR,
+    start: float | None,
+    end: float | None,
+    plan: _Plan,
 ) -> str:
     """把射击调进时段的建议; 调进去会提前击毁需求要求存活的目标时, 改为建议换目标。"""
     target = engagement.target_platform
     until = plan.survive_until.get(target)
-    if until is None or (start is not None and until <= start):
-        return "请把开火时刻调进该时段"
-    if end is not None and until >= end:
+    if until is not None and start is not None and until <= start:
+        until = None
+    by_id = {p.platform_id: p for p in scenario.platforms}
+    shooter, victim = by_id.get(engagement.shooter_platform), by_id.get(target)
+    # 射手还须满足开火斜距时, 只说"调进该时段"会让它又滑出包络。实测: 预备队那两发
+    # 正是为了进包络才挪出 540-900 s 的
+    limits = plan.ranges.get(engagement.shooter_platform)
+    if shooter is None or victim is None:
+        limits = None
+
+    def others() -> str:
+        if limits is None:
+            return ""
+        return _window_targets(scenario, shooter, limits, (start, end), plan, engagement)
+
+    if until is not None and end is not None and until >= end:
         return (
             f"但目标 {target} 按需求要在约 {until:.0f}s 进区时仍存活, 时段内开火会提前击毁它;"
-            f" 请改打别的目标, 再把开火时刻调进该时段"
+            f" 请改打别的目标{others()}, 再把开火时刻调进该时段"
         )
+    alive = "" if until is None else f"目标 {target} 按需求要在约 {until:.0f}s 进区时仍存活, "
+    if limits is not None:
+        earliest = start if until is None else until
+        spans = _envelope_spans(scenario, shooter, victim, limits, earliest, end)
+        if not spans:
+            return (
+                f"但按当前航路 {_span(earliest, end, 's')} 内 {shooter.platform_id} 与 {target}"
+                f" 都不在 {_span(*limits, 'km')} 的交战包络内; 请改打该时段内能进包络的目标{others()},"
+                f" 或调整航路让两者在该时段内进包络"
+            )
+        return (
+            f"{alive}请把开火时刻调进 {_join_spans(spans)} (该时段内两者在 {_span(*limits, 'km')}"
+            f" 包络内的部分, 离端点留 {_FIRE_MARGIN_S:g}s 以上余量)"
+        )
+    if until is None:
+        return "请把开火时刻调进该时段"
     later = f"{until:.0f}s 之后" if end is None else f"{until:.0f}-{end:g}s"
-    return (
-        f"目标 {target} 按需求要在约 {until:.0f}s 进区时仍存活, 请把开火时刻调进 {later},"
-        f" 或改打别的目标"
-    )
+    return f"{alive}请把开火时刻调进 {later}, 或改打别的目标"
 
 
 def _fire_phases(scenario, params, platforms, plan) -> list[str]:
@@ -464,10 +502,24 @@ def _fire_phases(scenario, params, platforms, plan) -> list[str]:
     if len(hit) >= params["min_count"]:
         return []
     actual = f"{times[0]:g}-{times[-1]:g}s" if times else "无"
+    # 被别的需求限定了开火时段的射手要点出来。实测: 预备队限定在 540-900 s, 模型为了
+    # 填空着的 900-1200 s 把它们的两发挪了过去
+    locked: dict[tuple[float | None, float | None], list[str]] = {}
+    for platform in platforms:
+        window = plan.fire_windows.get(platform.platform_id)
+        if window is not None and any(
+            e.shooter_platform == platform.platform_id for e in scenario.engagements
+        ):
+            locked.setdefault(window, []).append(platform.platform_id)
+    held = "".join(
+        f"; 其中 {'、'.join(ids)} 按需求只能在 {_span(*window, 's')} 开火, 不要把它们的射击挪出该时段"
+        for window, ids in locked.items()
+    )
     return [
         f"要求至少 {params['min_count']} 个时段有开火, 当前只有 {len(hit)} 个"
         f" (有开火: {'、'.join(hit) or '无'}; 没有开火: {'、'.join(empty)});"
         f" 当前实际开火时刻分布在 {actual}, 请把部分射击挪进空的时段 (航路要能支撑)"
+        + held
     ]
 
 
@@ -506,13 +558,35 @@ def _engagement_range(scenario, params, platforms, plan) -> list[str]:
                 if killed is not None and killed[1] != engagement.engagement_id:
                     horizon = min(horizon, killed[0])
         spans = _spans(lambda t: _within_or_none(_slant_km(shooter, target, t), low, high), horizon)
-        if spans:
+        # 射手被需求限定了开火时段时只给时段内的部分。实测: 只报"全程不在包络内", 模型改了
+        # 航路后把预备队的两发挪到 950/960 s, 出了要求的 540-900 s
+        window = plan.fire_windows.get(shooter.platform_id)
+        reachable = spans if window is None else _clip(spans, *window)
+        if reachable:
+            held = "" if window is None else f" (已限在射手按需求开火的 {_span(*window, 's')} 内)"
             advice = (
-                f"按当前航路两者相距在包络内的时段是 {_join_spans(spans)}; 请把开火时刻调进这些时段"
+                f"按当前航路两者相距在包络内的时段是 {_join_spans(reachable)}{held};"
+                f" 请把开火时刻调进这些时段"
                 f" (离端点留 {_FIRE_MARGIN_S:g}s 以上余量, 之后改航路时不至于又滑出包络), 或调整航路"
             )
         else:
-            advice = f"按当前航路, {horizon:g}s 之前两者都不在包络内; 请调整航路或改打别的目标"
+            others = _window_targets(
+                scenario, shooter, (low, high), window or (None, None), plan, engagement
+            )
+            if window is None:
+                advice = (
+                    f"按当前航路, {horizon:g}s 之前两者都不在包络内; 请调整航路或改打别的目标{others}"
+                )
+            else:
+                seen = (
+                    f"两者相距在包络内的时段是 {_join_spans(spans)}, 都在该时段之外" if spans
+                    else f"{horizon:g}s 之前两者都不在包络内"
+                )
+                advice = (
+                    f"射手 {shooter.platform_id} 按需求只能在 {_span(*window, 's')} 开火, 而按当前航路, {seen};"
+                    f" 请改打该时段内能进包络的目标{others}, 或调整航路让两者在该时段内进包络,"
+                    f" 不要把开火时刻挪出该时段"
+                )
         if voided is not None:
             pid, killed_at, killer = voided
             advice = (
@@ -520,7 +594,7 @@ def _engagement_range(scenario, params, platforms, plan) -> list[str]:
                 f" 计划时刻同样要落在包络内。{advice}"
                 + (
                     f"; 挪到 {killed_at:g}s 之前会让这发真的打出去"
-                    if any(start < killed_at for start, _ in spans)
+                    if any(start < killed_at for start, _ in reachable)
                     else ""
                 )
             )
@@ -705,6 +779,65 @@ def _spans(predicate, horizon: float) -> list[tuple[float, float]]:
     if opened is not None:
         spans.append((opened, last))
     return spans
+
+
+def _clip(
+    spans: list[tuple[float, float]], start: float | None, end: float | None
+) -> list[tuple[float, float]]:
+    """把时段截到 [start, end] 里; 截完不剩的丢掉。"""
+    clipped = [
+        (a if start is None else max(a, start), b if end is None else min(b, end))
+        for a, b in spans
+    ]
+    return [(a, b) for a, b in clipped if a <= b]
+
+
+def _envelope_spans(
+    scenario: ScenarioIR,
+    shooter: PlatformIR,
+    target: PlatformIR,
+    limits: tuple[float | None, float | None],
+    start: float | None,
+    end: float | None,
+) -> list[tuple[float, float]]:
+    """两者斜距在 ``limits`` 内、又落在 [start, end] 里的时段。"""
+    low, high = limits
+    spans = _spans(
+        lambda t: _within_or_none(_slant_km(shooter, target, t), low, high),
+        scenario.mission.duration_s,
+    )
+    return _clip(spans, start, end)
+
+
+def _window_targets(
+    scenario: ScenarioIR,
+    shooter: PlatformIR,
+    limits: tuple[float | None, float | None],
+    window: tuple[float | None, float | None],
+    plan: _Plan,
+    engagement: ScheduledEngagementIR,
+) -> str:
+    """射手在时段内能打进包络的其他目标; 计划里要被别的交战打掉的不算, 须存活到进区的从进区时刻算起。"""
+    start, end = window
+    killed = plan.destroyed.get(shooter.platform_id)
+    if killed is not None and killed[1] != engagement.engagement_id:
+        end = killed[0] if end is None else min(end, killed[0])
+    found: list[tuple[float, str, list[tuple[float, float]]]] = []
+    for target in scenario.platforms:
+        pid = target.platform_id
+        # 计划里别的交战要打掉的平台不算: 抢先打掉它会让那一发落空
+        if target.side == shooter.side or pid == engagement.target_platform or pid in plan.destroyed:
+            continue
+        until = plan.survive_until.get(pid)
+        earliest = start if until is None else (until if start is None else max(until, start))
+        spans = _envelope_spans(scenario, shooter, target, limits, earliest, end)
+        if spans:
+            found.append((-sum(b - a for a, b in spans), pid, spans))
+    if not found:
+        return ""
+    listed = "、".join(f"{pid} {_join_spans(spans)}" for _, pid, spans in sorted(found)[:_MAX_SPANS])
+    scope = "能进包络" if window == (None, None) else "该时段内能进包络"
+    return f" ({scope}、计划里也还没被打掉的有 {listed})"
 
 
 def _join_spans(spans: list[tuple[float, float]]) -> str:

@@ -355,6 +355,80 @@ def test_fire_window_suggests_retargeting_a_target_that_must_survive() -> None:
     assert len(split) == 1 and "请把开火时刻调进 199-250s, 或改打别的目标" in split[0]
 
 
+def _closer_red_2(scenario: ScenarioIR) -> ScenarioIR:
+    """把 red_2 挪到 122.4°E 起飞: 它约 80 s 就进入 blue_1 的 100 km, red_1 约 200 s 才进。"""
+    red_2 = next(p for p in scenario.platforms if p.platform_id == "red_2")
+    red_2.position.longitude_deg = 122.4
+    red_2.route[0].position.longitude_deg = 121.6
+    return scenario
+
+
+def test_engagement_range_keeps_the_shooter_inside_its_fire_window() -> None:
+    """rerun 实测: 包络只报时段外的部分, 模型把预备队的两发挪到 950/960 s, 出了 540-900 s。"""
+    scenario = _closer_red_2(_scenario([_shot("far", "blue_1", "red_1", 120.0)]))
+    envelope = _check("engagement_range", max_km=100.0)
+    held = evaluate_requirement_checks(
+        scenario, [envelope, _check("fire_window", shooters=["blue_1"], start_s=100.0, end_s=150.0)]
+    )
+    clipped = evaluate_requirement_checks(
+        scenario, [envelope, _check("fire_window", shooters=["blue_1"], start_s=100.0, end_s=250.0)]
+    )
+
+    assert len(held) == 1
+    assert "射手 blue_1 按需求只能在 100-150s 开火, 而按当前航路, 两者相距在包络内的时段是 " in held[0]
+    assert "都在该时段之外; 请改打该时段内能进包络的目标 (该时段内能进包络、计划里也还没被打掉的有 red_2 100-150s)" in held[0]
+    assert "不要把开火时刻挪出该时段" in held[0]
+    assert len(clipped) == 1 and "(已限在射手按需求开火的 100-250s 内)" in clipped[0]
+    span = clipped[0].split("包络内的时段是 ")[1].split("s (")[0]
+    start, end = (float(value) for value in span.split("-"))
+    assert 190 <= start <= 210 and end == 250
+
+
+def test_engagement_range_lists_targets_that_are_not_planned_kills() -> None:
+    """计划里要被别的交战打掉的平台不列为改打的目标。"""
+    scenario = _closer_red_2(_scenario([_shot("far", "blue_1", "red_1", 120.0)]))
+    envelope = _check("engagement_range", max_km=30.0)  # red_1 航路飞完前进不了 30 km
+
+    free = _issues(envelope, scenario)
+    taken = _issues(envelope, scenario, {"red_2": (300.0, "other")})
+
+    assert len(free) == 1 and "请调整航路或改打别的目标 (能进包络、计划里也还没被打掉的有 red_2 " in free[0]
+    assert len(taken) == 1 and "计划里也还没被打掉" not in taken[0]
+
+
+def test_fire_window_keeps_the_shot_inside_the_envelope() -> None:
+    """挪进时段的建议按包络截取; 时段内打不进包络时改为建议换目标。"""
+    scenario = _closer_red_2(_scenario([_shot("late", "blue_1", "red_1", 300.0)]))
+    envelope = _check("engagement_range", max_km=100.0)  # 300 s 时约 50 km, 在包络内
+    partly = evaluate_requirement_checks(
+        scenario, [envelope, _check("fire_window", shooters=["blue_1"], start_s=150.0, end_s=250.0)]
+    )
+    outside = evaluate_requirement_checks(
+        scenario, [envelope, _check("fire_window", shooters=["blue_1"], start_s=100.0, end_s=150.0)]
+    )
+
+    assert len(partly) == 1 and "请把开火时刻调进 " in partly[0]
+    span = partly[0].split("请把开火时刻调进 ")[1].split("s (")[0]
+    start, end = (float(value) for value in span.split("-"))
+    assert 190 <= start <= 210 and end == 250
+    assert "(该时段内两者在 ≤100km 包络内的部分, 离端点留 15s 以上余量)" in partly[0]
+    assert len(outside) == 1
+    assert "但按当前航路 100-150s 内 blue_1 与 red_1 都不在 ≤100km 的交战包络内" in outside[0]
+    assert "请改打该时段内能进包络的目标 (该时段内能进包络、计划里也还没被打掉的有 red_2 100-150s)" in outside[0]
+
+
+def test_fire_phases_names_shooters_held_to_their_own_window() -> None:
+    """rerun 实测: 预备队限定在 540-900 s, 模型为了填空着的 900-1200 s 把它们的两发挪了过去。"""
+    scenario = _scenario([_shot("reserve", "blue_1", "red_1", 100.0), _shot("main", "blue_2", "red_2", 120.0)])
+    phases = _check("fire_phases", windows=[[0.0, 200.0], [200.0, 400.0]], min_count=2)
+    window = _check("fire_window", shooters=["blue_1"], start_s=50.0, end_s=150.0)
+    issues = evaluate_requirement_checks(scenario, [phases, window])
+
+    assert len(issues) == 1
+    assert issues[0].endswith("; 其中 blue_1 按需求只能在 50-150s 开火, 不要把它们的射击挪出该时段")
+    assert "其中" not in _issues(phases, scenario)[0]
+
+
 def test_reach_area_suggests_retargeting_when_the_shooter_is_held_to_a_window() -> None:
     """射手只能在进区之前开火时, 推迟射击行不通。"""
     scenario = _scenario([_shot("early", "red_1", "blue_1", 120.0)])
