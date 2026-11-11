@@ -1436,3 +1436,65 @@ def test_truncated_reply_is_not_closed() -> None:
     result = ScenarioIRPlanner(llm=llm).plan("任务")
     assert not result.success
     assert "上限被截断" in result.attempts[0].errors[-1]
+
+
+# ── 修订后同步意图 ───────────────────────────────────────────────
+
+
+def _synced_ir() -> dict[str, Any]:
+    """_valid_ir 里 blue_awacs 的意图没写航路; 这里补齐, 让意图与物理平台一致。"""
+    ir = _valid_ir()
+    ir["mission"]["platforms"][0]["route"] = [ir["platforms"][0]["route"][0]["position"]]
+    return ir
+
+
+_EXTRA_LEG = {
+    "position": {"latitude_deg": 27.7, "longitude_deg": 121.3, "altitude_m": 9000.0},
+    "speed_mps": 200.0,
+}
+
+
+def test_revised_route_is_synced_into_the_intent() -> None:
+    base = _synced_ir()
+    revised = copy.deepcopy(base)
+    revised["platforms"][0]["route"].append(_EXTRA_LEG)
+    notes = planner_module._sync_revised_intents(base, revised)
+
+    assert revised["mission"]["platforms"][0]["route"] == [
+        point["position"] for point in revised["platforms"][0]["route"]
+    ]
+    assert len(notes) == 1 and "blue_awacs" in notes[0]
+
+
+@pytest.mark.parametrize("edit_intent", [False, True])
+def test_intent_is_left_alone_when_the_model_meant_it(edit_intent: bool) -> None:
+    """上一版本来就不一致, 或这一版意图也改了: 不替模型决定。"""
+    base = _synced_ir() if edit_intent else _valid_ir()
+    revised = copy.deepcopy(base)
+    revised["platforms"][0]["route"].append(_EXTRA_LEG)
+    if edit_intent:
+        revised["mission"]["platforms"][0]["route"] = []
+    expected = copy.deepcopy(revised["mission"]["platforms"])
+
+    assert planner_module._sync_revised_intents(base, revised) == []
+    assert revised["mission"]["platforms"] == expected
+
+
+def test_patched_route_keeps_the_intent_in_step() -> None:
+    """rerun 实测: refine 补丁只给 platforms[].route 补了航点, 意图航路少一个点。"""
+    ir = _synced_ir()
+    ir["platforms"][1]["position"] = dict(ir["platforms"][0]["position"])  # 重叠, 触发 refine
+    route = [*_synced_ir()["platforms"][0]["route"], _EXTRA_LEG]
+    llm = ScriptedLLM([
+        _dumps(ir),
+        _patch({"platforms": [
+            {"platform_id": "blue_awacs", "route": route},
+            *_restore_red_radar()["platforms"],
+        ]}),
+    ])
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=2).plan("任务")
+
+    assert result.success and result.advisories == []
+    intent = result.scenario_ir["mission"]["platforms"][0]
+    assert intent["route"] == [point["position"] for point in route]
+    assert any("blue_awacs" in note for note in result.normalizations)

@@ -420,22 +420,35 @@ def _engagement_range(scenario, params, platforms, destroyed) -> list[str]:
         target = by_id.get(engagement.target_platform)
         if shooter is None or target is None or shooter.platform_id not in shooters:
             continue
-        if not _happens(engagement, destroyed):
-            continue  # 打不出的射击由交战时序检查负责报
         moment = engagement.fire_time_s
         km = _slant_km(shooter, target, moment)
         if km is None or _within(km, low, high):
             continue  # 航路飞完之后的位置推算不出, 不下结论
+        # 按计划打不出的射击照样核验: 前面的击毁一旦没生效, 它会在包络外开火。
+        # 实测: 先手方把对方射手提前打掉, 对方那几发计划仍停在 100 km 外
+        voided = _voided_by(engagement, destroyed)
         horizon = duration
-        for platform_id in (shooter.platform_id, target.platform_id):
-            killed = destroyed.get(platform_id)
-            if killed is not None and killed[1] != engagement.engagement_id:
-                horizon = min(horizon, killed[0])
+        if voided is None:
+            for platform_id in (shooter.platform_id, target.platform_id):
+                killed = destroyed.get(platform_id)
+                if killed is not None and killed[1] != engagement.engagement_id:
+                    horizon = min(horizon, killed[0])
         spans = _spans(lambda t: _within_or_none(_slant_km(shooter, target, t), low, high), horizon)
         if spans:
             advice = f"按当前航路两者相距在包络内的时段是 {_join_spans(spans)}; 请把开火时刻调进这些时段, 或调整航路"
         else:
             advice = f"按当前航路, {horizon:g}s 之前两者都不在包络内; 请调整航路或改打别的目标"
+        if voided is not None:
+            pid, killed_at, killer = voided
+            advice = (
+                f"按计划 {pid} 在 {killed_at:g}s 已被交战 {killer} 摧毁, 这发本打不出; 但前面的击毁一旦没生效它就会开火,"
+                f" 计划时刻同样要落在包络内。{advice}"
+                + (
+                    f"; 挪到 {killed_at:g}s 之前会让这发真的打出去"
+                    if any(start < killed_at for start, _ in spans)
+                    else ""
+                )
+            )
         messages.append(
             f"交战 {engagement.engagement_id} 在 {moment:g}s 开火时 {shooter.platform_id} 与 "
             f"{target.platform_id} 斜距约 {km:.0f} km, 不在要求的 {_span(low, high, 'km')} 内。{advice}"
@@ -524,14 +537,23 @@ _EVALUATORS = {
 
 def _happens(engagement: ScheduledEngagementIR, destroyed: dict[str, tuple[float, str]]) -> bool:
     """射手和目标在开火时都还在 (同一秒互射谁先谁后无法预知, 按会发生算)。"""
+    return _voided_by(engagement, destroyed) is None
+
+
+def _voided_by(
+    engagement: ScheduledEngagementIR, destroyed: dict[str, tuple[float, str]]
+) -> tuple[str, float, str] | None:
+    """开火前已被摧毁的一方 ``(平台, 时刻, 交战 id)``; 射击会发生时返回 None。"""
     moment = engagement.fire_time_s
     shooter = destroyed.get(engagement.shooter_platform)
     if shooter is not None and shooter[0] < moment:
-        return False
+        return engagement.shooter_platform, *shooter
     target = destroyed.get(engagement.target_platform)
-    if target is None:
-        return True
-    return not (target[0] < moment or (target[0] == moment and target[1] != engagement.engagement_id))
+    if target is not None and (
+        target[0] < moment or (target[0] == moment and target[1] != engagement.engagement_id)
+    ):
+        return engagement.target_platform, *target
+    return None
 
 
 def _slant_km(first: PlatformIR, second: PlatformIR, moment: float) -> float | None:

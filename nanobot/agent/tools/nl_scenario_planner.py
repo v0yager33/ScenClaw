@@ -611,6 +611,89 @@ def normalize_ir_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], list[
     return result, notes
 
 
+def _sync_revised_intents(base: dict[str, Any], revised: dict[str, Any]) -> list[str]:
+    """修订只改了物理平台的位置或航路时, 原地同步 mission.platforms 里的意图, 返回说明。
+
+    实测: refine 补丁给 platforms[].route 补了航点, 没动 mission.platforms[].route, 交付的
+    IR 里意图航路比编译出的航路少一个点。只在上一版两者一致、这一版意图没改时同步;
+    上一版本来就不一致, 或这一版意图也改了, 说明模型另有打算, 不替它决定。
+    """
+    old_platforms = _entries_by_id(base.get("platforms"))
+    old_intents = _entries_by_id(_mission_platforms(base))
+    intents = _entries_by_id(_mission_platforms(revised))
+    synced: list[str] = []
+    for platform_id, platform in _entries_by_id(revised.get("platforms")).items():
+        old_platform = old_platforms.get(platform_id)
+        old_intent, intent = old_intents.get(platform_id), intents.get(platform_id)
+        if old_platform is None or old_intent is None or intent is None:
+            continue
+        before, after = _platform_track(old_platform), _platform_track(platform)
+        if before is None or after is None or after == before:
+            continue
+        if _intent_track(old_intent) != before or _intent_track(intent) != before:
+            continue
+        intent["initial_position"] = copy.deepcopy(platform["position"])
+        intent["route"] = [copy.deepcopy(point["position"]) for point in platform.get("route") or []]
+        synced.append(platform_id)
+    if not synced:
+        return []
+    return [f"修订只改了 {'、'.join(synced)} 的物理位置或航路, 已同步到 mission.platforms 里的意图"]
+
+
+def _mission_platforms(payload: dict[str, Any]) -> Any:
+    mission = payload.get("mission")
+    return mission.get("platforms") if isinstance(mission, dict) else None
+
+
+def _entries_by_id(entries: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(entries, list):
+        return {}
+    return {
+        entry["platform_id"]: entry for entry in entries
+        if isinstance(entry, dict) and isinstance(entry.get("platform_id"), str)
+    }
+
+
+_Point = tuple[float, float, float]
+_Track = tuple[_Point, tuple[_Point, ...]]
+
+
+def _platform_track(platform: dict[str, Any]) -> _Track | None:
+    route = platform.get("route") or []
+    if not isinstance(route, list):
+        return None
+    points = [point.get("position") if isinstance(point, dict) else None for point in route]
+    return _track(platform.get("position"), points)
+
+
+def _intent_track(intent: dict[str, Any]) -> _Track | None:
+    route = intent.get("route") or []
+    if not isinstance(route, list):
+        return None
+    return _track(intent.get("initial_position"), route)
+
+
+def _track(start: Any, points: list[Any]) -> _Track | None:
+    """起点加航点的可比较形式; 有点缺坐标时返回 None (判断不了两者是否一致)。"""
+    keys = [_point_key(point) for point in [start, *points]]
+    if any(key is None for key in keys):
+        return None
+    return keys[0], tuple(keys[1:])
+
+
+def _point_key(point: Any) -> _Point | None:
+    if not isinstance(point, dict):
+        return None
+    try:
+        return (
+            float(point["latitude_deg"]),
+            float(point["longitude_deg"]),
+            float(point.get("altitude_m", 0.0)),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _drop_redundant_extra_fields(payload: dict[str, Any]) -> list[str]:
     """原地删掉 schema 里没有、又不携带信息的字段, 返回删除说明。
 
@@ -1375,8 +1458,13 @@ class ScenarioIRPlanner:
             if patch_errors:
                 scenario, afsim_code, errors, normalizations = None, "", patch_errors, []
             else:
+                # 修订只改了物理航路时把意图跟上, 否则交付的 IR 里两处航路对不上
+                synced = (
+                    _sync_revised_intents(patch_base, payload) if patch_base is not None else []
+                )
                 # 先做确定性归一化: 答案唯一的机械问题不必浪费修复轮次
                 payload, normalizations = normalize_ir_payload(payload)
+                normalizations = [*synced, *normalizations]
                 scenario, afsim_code, errors = self._validate_and_compile(payload)
             if scenario is None:
                 attempts.append(PlanAttempt(round_index, stage, False, errors, patched=patched))

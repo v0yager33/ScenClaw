@@ -256,13 +256,33 @@ def test_engagement_range_without_any_span_says_so() -> None:
     assert len(issues) == 1 and "之前两者都不在包络内" in issues[0]
 
 
-def test_engagement_range_skips_shots_it_cannot_place_or_that_never_happen() -> None:
-    scenario = _scenario([
-        _shot("after_route", "blue_1", "red_1", 500.0),
-        _shot("dead_shooter", "blue_2", "red_2", 50.0),
-    ])
+def test_engagement_range_skips_shots_it_cannot_place() -> None:
+    scenario = _scenario([_shot("after_route", "blue_1", "red_1", 500.0)])
+    assert _issues(_check("engagement_range", max_km=100.0), scenario) == []
+
+
+def test_engagement_range_checks_shots_that_never_happen() -> None:
+    """rerun 实测: 对方射手被提前打掉, 那几发计划停在 100 km 外; 击毁没生效就会在包络外开火。"""
+    scenario = _scenario([_shot("dead_shooter", "blue_2", "red_2", 50.0)])
     check = _check("engagement_range", max_km=100.0)
-    assert _issues(check, scenario, {"blue_2": (10.0, "other")}) == []
+    issues = _issues(check, scenario, {"blue_2": (10.0, "other")})
+
+    assert len(issues) == 1
+    assert "按计划 blue_2 在 10s 已被交战 other 摧毁" in issues[0]
+    assert "包络内的时段是 " in issues[0]  # 按双方都在推算, 不截到 10s
+    assert "挪到" not in issues[0]  # 包络时段都在 10s 之后, 挪过去仍打不出
+
+
+def test_engagement_range_says_when_moving_earlier_makes_the_shot_real() -> None:
+    """包络时段落在击毁之前时, 挪进去这发就真的会打出去。"""
+    # 两机约 196s 进入 100 km、约 276s 近于 60 km; 290s 已贴得太近
+    scenario = _scenario([_shot("too_close", "blue_2", "red_2", 290.0)])
+    check = _check("engagement_range", min_km=60.0, max_km=100.0)
+    issues = _issues(check, scenario, {"blue_2": (280.0, "other")})
+
+    assert len(issues) == 1
+    assert "按计划 blue_2 在 280s 已被交战 other 摧毁" in issues[0]
+    assert "挪到 280s 之前会让这发真的打出去" in issues[0]
 
 
 @pytest.mark.parametrize(("params", "destroyed", "expected"), [
