@@ -1,6 +1,6 @@
 """ReAct Engine — Reasoning + Acting 自主规划引擎。
 
-基于 Yao Shunyu 的 ReAct 论文: 交替执行推理 (Thought) 和行动 (Action)，
+基于 ReAct 论文: 交替执行推理 (Thought) 和行动 (Action)，
 通过观察 (Observation) 反馈来驱动多步决策。
 
 与传统固定流水线的区别:
@@ -98,6 +98,8 @@ class DeepSeekClient:
         # 最近一次调用的 finish_reason; "length" 表示输出被 max_tokens 截断。
         # 推理模型的思维链与正文共用 max_tokens, 大想定最容易在这里被截断。
         self.last_finish_reason: str | None = None
+        # 最近一次调用的 usage; 推理模型在 completion_tokens_details 里给出思维链占了多少
+        self.last_usage: dict[str, Any] | None = None
 
     @classmethod
     def from_env(cls, **overrides: Any) -> "DeepSeekClient":
@@ -142,8 +144,10 @@ class DeepSeekClient:
                         request=resp.request, response=resp,
                     )
                 resp.raise_for_status()
-                choice = resp.json()["choices"][0]
+                body = resp.json()
+                choice = body["choices"][0]
                 self.last_finish_reason = choice.get("finish_reason")
+                self.last_usage = body.get("usage")
                 return choice["message"]["content"] or ""
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code if exc.response is not None else None

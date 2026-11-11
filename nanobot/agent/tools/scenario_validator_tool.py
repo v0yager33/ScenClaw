@@ -22,7 +22,6 @@ from typing import Any
 
 from nanobot.agent.tools.base import Tool
 
-
 # ═══════════════════════════════════════════════════════
 # 验证规则定义
 # ═══════════════════════════════════════════════════════
@@ -517,7 +516,7 @@ class ScenarioValidator:
                 if stripped.startswith(keyword + " ") or stripped == keyword:
                     stats[keyword] = stats.get(keyword, 0) + 1
         stats["total_lines"] = len(self.lines)
-        stats["non_empty_lines"] = sum(1 for l in self.lines if l.strip())
+        stats["non_empty_lines"] = sum(1 for line in self.lines if line.strip())
         self.result.stats = stats
 
     # ── Level 1: 语法检查 ──
@@ -620,12 +619,20 @@ class ScenarioValidator:
         非 AFSIM 全集, 报 error 会把使用了合法但未登记类型的想定判死。同一行里
         重复出现的同一个词元只报一次。
         """
+        # WSF_ 前缀也可出现在项目自定义类型名中，不能把已声明的类型当作未知基类。
+        declared_types: set[str] = set()
+        for line in self.lines:
+            tokens = _strip_comments(line).split()
+            if len(tokens) >= 3 and tokens[0] in (
+                "platform_type", "sensor", "weapon", "weapon_effects", "radar_signature",
+            ):
+                declared_types.add(tokens[1])
         for i, line in enumerate(self.lines, 1):
             stripped = _strip_comments(line)
             if not stripped:
                 continue
             for word in dict.fromkeys(_WSF_TOKEN_RE.findall(stripped)):
-                if word in _VALID_BASE_TYPES:
+                if word in _VALID_BASE_TYPES or word in declared_types:
                     continue
                 self.result.add_issue(ValidationIssue(
                     level="syntax", severity="warning", line_number=i,

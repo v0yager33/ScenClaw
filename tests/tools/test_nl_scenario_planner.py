@@ -13,15 +13,21 @@ from __future__ import annotations
 
 import copy
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
-from nanobot.afsim import ScenarioIR
+from nanobot.afsim import AfsimCompiler, CompileError, ScenarioIR, emit_project
+from nanobot.agent.tools import nl_scenario_planner as planner_module
 from nanobot.agent.tools.nl_scenario_planner import (
+    NLToAfsimTool,
+    ScenarioCompileTool,
     ScenarioIRPlanner,
     _parse_json_object,
+    _write_project_output,
+    acknowledged_engagement_issues,
     check_ir_plausibility,
 )
 
@@ -165,6 +171,28 @@ def test_parse_json_object_rejects_empty() -> None:
     assert errors
 
 
+def test_parse_json_object_tolerates_trailing_extra_closer() -> None:
+    """实测: 完整的 IR 末尾多写了一个 "}", 不该整版作废。"""
+    payload, errors = _parse_json_object('{"a": {"b": 1}, "c": [2]}}\n')
+    assert payload == {"a": {"b": 1}, "c": [2]}
+    assert errors == []
+
+
+def test_parse_json_object_rejects_premature_close() -> None:
+    """闭合符后面还有字段, 说明对象提前闭合了, 解出来的是残缺版。"""
+    payload, errors = _parse_json_object('{"a": {"b": 1}}, "c": 2}')
+    assert payload is None
+    assert "提前闭合" in errors[0]
+    assert '"c": 2' in errors[0]
+
+
+def test_parse_json_object_reports_syntax_error_location() -> None:
+    payload, errors = _parse_json_object('{"a": 1, "b": tru}')
+    assert payload is None
+    assert "第 14 个字符" in errors[0]
+    assert '"b": ⟦此处⟧tru}' in errors[0]
+
+
 # ── 单轮成功 ────────────────────────────────────────────────────────
 
 
@@ -230,6 +258,17 @@ def test_invalid_json_triggers_reformat_request() -> None:
     assert result.success
     assert result.attempts[0].ok is False
     assert "JSON" in llm.calls[1][-1]["content"]
+
+
+def test_invalid_json_repair_feeds_back_full_output() -> None:
+    """只回灌前 2000 字时, 模型看不到自己写过的 IR, 只能整版重新推演。"""
+    broken = _dumps(_valid_ir())[:-1] + "x" * 3000 + "}"
+    llm = ScriptedLLM([broken, _dumps(_valid_ir())])
+    result = ScenarioIRPlanner(llm=llm).plan("预警机搜索红方雷达")
+
+    assert result.success
+    assert llm.calls[1][-2] == {"role": "assistant", "content": broken}
+    assert "个字符" in llm.calls[1][-1]["content"]
 
 
 def test_repair_rounds_are_bounded() -> None:
@@ -305,6 +344,19 @@ def test_refine_round_fixes_plausibility_issue() -> None:
     assert result.advisories == []       # 最终版本已清零
 
 
+def test_refine_prompt_forbids_deleting_required_content() -> None:
+    """按条数验收时, 删掉需求要求的射击计划也能"清零", 必须在提示里堵住。"""
+    overlapping = _valid_ir()
+    overlapping["platforms"][1]["position"] = dict(overlapping["platforms"][0]["position"])
+
+    llm = ScriptedLLM([_dumps(overlapping), _dumps(_valid_ir())])
+    ScenarioIRPlanner(llm=llm).plan("预警机搜索红方雷达")
+
+    refine_prompt = llm.calls[1][-1]["content"]
+    assert "核对原始需求" in refine_prompt
+    assert "不要为了消掉问题删减需求要求的" in refine_prompt
+
+
 def test_refine_never_regresses_to_worse_ir() -> None:
     """refine 轮把 IR 改得更差时, 必须保留上一版较好的结果。"""
     good_but_overlapping = _valid_ir()
@@ -325,19 +377,293 @@ def test_refine_never_regresses_to_worse_ir() -> None:
 
 
 def test_refine_breaking_schema_keeps_previous_valid_result() -> None:
-    """refine 轮返回非法 IR 时, 不能把已经拿到的合法结果丢掉。"""
+    """refine 轮返回非法 IR 时, 不能把已经拿到的合法结果丢掉; 补救一次仍是坏的就停。"""
     overlapping = _valid_ir()
     overlapping["platforms"][1]["position"] = dict(overlapping["platforms"][0]["position"])
 
     broken = _valid_ir()
     broken["selected_coa"]["mission_id"] = "mismatched"
 
-    llm = ScriptedLLM([_dumps(overlapping), _dumps(broken)])
+    llm = ScriptedLLM([_dumps(overlapping), _dumps(broken), _dumps(broken)])
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=4).plan("任务")
+
+    assert result.success
+    assert result.afsim_code
+    assert len(llm.calls) == 3
+    assert [a.stage for a in result.attempts] == ["extract", "refine", "repair"]
+    assert result.attempts[-1].ok is False
+    assert any("初始位置完全相同" in a for a in result.advisories)
+
+
+def test_refine_breaking_schema_gets_one_repair() -> None:
+    """refine 修对了问题却带了个 schema 小错: 补一次 repair, 不整版丢掉。"""
+    overlapping = _valid_ir()
+    overlapping["platforms"][1]["position"] = dict(overlapping["platforms"][0]["position"])
+
+    broken = _valid_ir()
+    broken["selected_coa"]["mission_id"] = "mismatched"
+
+    llm = ScriptedLLM([_dumps(overlapping), _dumps(broken), _dumps(_valid_ir())])
+    result = ScenarioIRPlanner(llm=llm).plan("任务")
+
+    assert [a.stage for a in result.attempts] == ["extract", "refine", "repair"]
+    repair_call = llm.calls[2]
+    assert json.loads(repair_call[-2]["content"])["selected_coa"]["mission_id"] == "mismatched"
+    assert "没通过校验" in repair_call[-1]["content"]
+    assert result.advisories == []
+
+
+def test_refine_feeds_back_the_complete_previous_ir() -> None:
+    """大想定的 IR 远超 6000 字符, 回灌时截断会让模型看不到自己的上一版。"""
+    overlapping = _valid_ir()
+    overlapping["platforms"][1]["position"] = dict(overlapping["platforms"][0]["position"])
+    overlapping["mission"]["assumptions"] = [f"假设 {i}: " + "补全参数" * 40 for i in range(40)]
+
+    llm = ScriptedLLM([_dumps(overlapping), _dumps(_valid_ir())])
+    ScenarioIRPlanner(llm=llm).plan("预警机搜索红方雷达")
+
+    fed_back = llm.calls[1][-2]
+    assert fed_back["role"] == "assistant"
+    assert len(fed_back["content"]) > 6000
+    assert json.loads(fed_back["content"])["mission"]["assumptions"] == overlapping["mission"]["assumptions"]
+
+
+def test_refine_conversation_keeps_only_the_latest_version() -> None:
+    """逐轮累加完整 IR 会撑爆上下文; 每轮只带最新一版和它的问题清单。"""
+    overlapping = _valid_ir()
+    overlapping["platforms"][1]["position"] = dict(overlapping["platforms"][0]["position"])
+
+    llm = ScriptedLLM([_dumps(overlapping)] * 3)
+    ScenarioIRPlanner(llm=llm, max_repair_rounds=3).plan("任务")
+
+    assert [len(call) for call in llm.calls] == [2, 4, 4]
+    assert llm.calls[2][:2] == llm.calls[0]
+
+
+def test_regressed_refine_feeds_back_the_kept_version() -> None:
+    """问题变多的版本被拒后, 下一轮回灌的 IR 要与列出的问题清单对得上。"""
+    kept = _valid_ir()
+    kept["platforms"][1]["position"] = dict(kept["platforms"][0]["position"])
+    worse = copy.deepcopy(kept)
+    worse["assertions"][0]["sensor_name"] = "nonexistent"
+
+    llm = ScriptedLLM([_dumps(kept), _dumps(worse), _dumps(_valid_ir())])
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=3).plan("任务")
+
+    fed_back = json.loads(llm.calls[2][-2]["content"])
+    assert fed_back["assertions"][0]["sensor_name"] == "radar"
+    assert "nonexistent" not in llm.calls[2][-1]["content"]
+    assert result.advisories == []
+
+
+def test_failed_refine_call_keeps_previous_valid_result() -> None:
+    """refine 调用超时不该把首轮已经拿到的合法想定一起丢掉。"""
+    overlapping = _valid_ir()
+    overlapping["platforms"][1]["position"] = dict(overlapping["platforms"][0]["position"])
+
+    class TimeoutOnRefine(ScriptedLLM):
+        def chat(self, messages: list[dict], **kwargs: Any) -> str:
+            if self.calls:
+                raise TimeoutError("read timeout")
+            return super().chat(messages, **kwargs)
+
+    llm = TimeoutOnRefine([_dumps(overlapping)])
     result = ScenarioIRPlanner(llm=llm).plan("任务")
 
     assert result.success
     assert result.afsim_code
     assert result.attempts[-1].ok is False
+    assert "TimeoutError" in result.attempts[-1].errors[0]
+
+
+def test_failed_first_call_still_raises() -> None:
+    """还没有任何合法结果时, 调用失败照常抛给上层工具处理。"""
+    class AlwaysTimeout(ScriptedLLM):
+        def chat(self, messages: list[dict], **kwargs: Any) -> str:
+            raise TimeoutError("read timeout")
+
+    with pytest.raises(TimeoutError):
+        ScenarioIRPlanner(llm=AlwaysTimeout([])).plan("任务")
+
+
+# ── 交战时序与弹量 ──────────────────────────────────────────────────
+
+
+def _engagement(engagement_id: str, shooter: str, target: str, weapon: str, time_s: float) -> dict[str, Any]:
+    return {
+        "engagement_id": engagement_id,
+        "shooter_platform": shooter,
+        "target_platform": target,
+        "weapon_name": weapon,
+        "fire_time_s": time_s,
+    }
+
+
+def _duel_payload(
+    engagements: list[dict[str, Any]], *, quantity: int = 2, assumptions: list[str] | None = None
+) -> dict[str, Any]:
+    """在最小 IR 上给双方各配一件隐式武器。"""
+    ir = _valid_ir()
+    ir["platforms"][0]["weapons"] = [{"instance_name": "aam", "quantity": quantity}]
+    ir["platforms"][1]["weapons"] = [{"instance_name": "sam", "quantity": quantity}]
+    ir["engagements"] = copy.deepcopy(engagements)
+    if assumptions is not None:
+        ir["mission"]["assumptions"] = assumptions
+    return ir
+
+
+def _duel_ir(
+    engagements: list[dict[str, Any]], *, quantity: int = 2, assumptions: list[str] | None = None
+) -> ScenarioIR:
+    return ScenarioIR.model_validate(
+        _duel_payload(engagements, quantity=quantity, assumptions=assumptions)
+    )
+
+
+_RETURN_FIRE = [
+    _engagement("strike", "blue_awacs", "red_radar", "aam", 600.0),
+    _engagement("reply", "red_radar", "blue_awacs", "sam", 615.0),
+]
+
+
+def test_plausibility_accepts_a_single_supported_shot() -> None:
+    scenario = _duel_ir([_engagement("strike", "blue_awacs", "red_radar", "aam", 600.0)])
+    assert check_ir_plausibility(scenario) == []
+
+
+def test_plausibility_flags_return_fire_from_destroyed_shooter() -> None:
+    """实跑里的典型写法: A 先射 B, B 晚 15s 回射 A —— 后一发永远打不出来。"""
+    scenario = _duel_ir(_RETURN_FIRE)
+    issues = check_ir_plausibility(scenario)
+    assert any("交战 reply" in i and "射手 red_radar 已在 600s" in i for i in issues)
+
+
+def test_acknowledged_destroyed_shooter_is_listed_but_not_an_issue() -> None:
+    """需求要求每架都有射击计划时, 最先被击毁的那架注定打不出; 写明原因就不再逼模型去消。"""
+    scenario = _duel_ir(
+        _RETURN_FIRE, assumptions=["reply: 需求要求红方阵地也有射击计划, 它会先被 strike 摧毁"]
+    )
+    # 红方没配传感器会另报一条, 这里只看时序
+    assert not any("射手 red_radar 已在" in i for i in check_ir_plausibility(scenario))
+    acknowledged = acknowledged_engagement_issues(scenario)
+    assert len(acknowledged) == 1
+    assert "射手 red_radar 已在 600s" in acknowledged[0]
+
+
+def test_acknowledgement_matches_whole_engagement_id() -> None:
+    """写了 reply_2 或 xreply 的说明, 不能顺带覆盖 reply。"""
+    scenario = _duel_ir(_RETURN_FIRE, assumptions=["reply_2 与 xreply 是有意安排"])
+    assert any("射手 red_radar 已在" in i for i in check_ir_plausibility(scenario))
+    assert acknowledged_engagement_issues(scenario) == []
+
+
+def test_wasted_shot_cannot_be_acknowledged() -> None:
+    """打已毁目标只是白白浪费一发, 总能改打别的目标, 说明了也照样算问题。"""
+    scenario = _duel_ir(
+        [
+            _engagement("first", "blue_awacs", "red_radar", "aam", 600.0),
+            _engagement("second", "blue_awacs", "red_radar", "aam", 700.0),
+        ],
+        assumptions=["second 是补射"],
+    )
+    assert any("交战 second" in i for i in check_ir_plausibility(scenario))
+    assert acknowledged_engagement_issues(scenario) == []
+
+
+def test_plan_result_reports_acknowledged_shots_separately() -> None:
+    payload = _duel_payload(_RETURN_FIRE, assumptions=["reply 打不出: 红方阵地先被摧毁"])
+    result = ScenarioIRPlanner(llm=ScriptedLLM([_dumps(payload)]), max_repair_rounds=1).plan("任务")
+
+    assert result.success
+    assert not any("射手 red_radar 已在" in a for a in result.advisories)
+    assert any("射手 red_radar 已在" in a for a in result.acknowledged)
+
+
+def test_timeline_digest_marks_waypoints_lost_to_early_kill() -> None:
+    """蓝方 113s 才到航点, 50s 就被击毁: 时间线要直接点出这段航路飞不到。"""
+    scenario = _duel_ir([_engagement("ambush", "red_radar", "blue_awacs", "sam", 50.0)])
+    digest = "\n".join(planner_module._timeline_digest(scenario))
+    assert "- blue_awacs: 航点预计到达 1" in digest
+    assert "50s 被交战 ambush 摧毁, 之后 1 个航点不会飞到" in digest
+    assert "- red_radar: 无航路" in digest
+
+
+def test_refine_prompt_carries_computed_timeline() -> None:
+    """时间窗核对本该是确定性计算, 不该让推理模型在思考里重算。"""
+    llm = ScriptedLLM([_dumps(_duel_payload(_RETURN_FIRE)), _dumps(_valid_ir())])
+    ScenarioIRPlanner(llm=llm).plan("任务")
+
+    refine_prompt = llm.calls[1][-1]["content"]
+    assert "按当前 IR 推算的时间线" in refine_prompt
+    assert "- blue_awacs: 航点预计到达" in refine_prompt
+    assert "- red_radar: 无航路; 600s 被交战 strike 摧毁" in refine_prompt
+
+
+def test_plausibility_flags_shot_at_destroyed_target() -> None:
+    scenario = _duel_ir([
+        _engagement("first", "blue_awacs", "red_radar", "aam", 600.0),
+        _engagement("second", "blue_awacs", "red_radar", "aam", 700.0),
+    ])
+    issues = check_ir_plausibility(scenario)
+    assert any("交战 second" in i and "目标 red_radar 已在 600s" in i for i in issues)
+
+
+def test_plausibility_flags_simultaneous_shots_on_one_target() -> None:
+    scenario = _duel_ir([
+        _engagement("first", "blue_awacs", "red_radar", "aam", 600.0),
+        _engagement("second", "blue_awacs", "red_radar", "aam", 600.0),
+    ])
+    issues = check_ir_plausibility(scenario)
+    assert any("同时射击 red_radar" in i for i in issues)
+
+
+def test_plausibility_flags_same_second_exchange_as_uncertain() -> None:
+    """同一秒的两条 execute 也是逐条执行的: 不判"射手已毁", 但两发都可能打不出。"""
+    scenario = _duel_ir([
+        _engagement("strike", "blue_awacs", "red_radar", "aam", 600.0),
+        _engagement("reply", "red_radar", "blue_awacs", "sam", 600.0),
+    ])
+    issues = check_ir_plausibility(scenario)
+    assert not any("已在" in i for i in issues)
+    assert any("交战 strike" in i and "同一时刻" in i and "交战 reply" in i for i in issues)
+    assert any("交战 reply" in i and "同一时刻" in i and "交战 strike" in i for i in issues)
+
+
+def test_plausibility_accepts_staggered_chain() -> None:
+    """被打的一方先打别的目标, 再被击毁: 两发都打得出。"""
+    ir = _valid_ir()
+    ir["platforms"][0]["weapons"] = [{"instance_name": "aam", "quantity": 2}]
+    ir["platforms"][1]["weapons"] = [{"instance_name": "sam", "quantity": 2}]
+    wingman = copy.deepcopy(ir["platforms"][0])
+    wingman["platform_id"] = "blue_wing"
+    wingman["position"]["latitude_deg"] += 0.1
+    for point in wingman["route"]:
+        point["position"]["latitude_deg"] += 0.1
+    ir["platforms"].append(wingman)
+    wing_intent = copy.deepcopy(ir["mission"]["platforms"][0])
+    wing_intent["platform_id"] = "blue_wing"
+    wing_intent["initial_position"] = copy.deepcopy(wingman["position"])
+    ir["mission"]["platforms"].append(wing_intent)
+    ir["engagements"] = [
+        _engagement("red_first", "red_radar", "blue_wing", "sam", 590.0),
+        _engagement("blue_kill", "blue_awacs", "red_radar", "aam", 600.0),
+    ]
+    scenario = ScenarioIR.model_validate(ir)
+    issues = check_ir_plausibility(scenario)
+    # 红方没配传感器会另报一条, 这里只看时序
+    assert not any("已在" in i or "同一时刻" in i or "同时射击" in i for i in issues)
+
+
+def test_plausibility_flags_shots_beyond_quantity() -> None:
+    scenario = _duel_ir(
+        [
+            _engagement("first", "blue_awacs", "red_radar", "aam", 600.0),
+            _engagement("second", "blue_awacs", "red_radar", "aam", 700.0),
+        ],
+        quantity=1,
+    )
+    issues = check_ir_plausibility(scenario)
+    assert any("quantity=1" in i and "2 次射击" in i for i in issues)
 
 
 # ── 提示词内容 ──────────────────────────────────────────────────────
@@ -364,8 +690,749 @@ def test_system_prompt_lists_only_whitelisted_types() -> None:
     assert "WSF_RADAR_SENSOR" not in system_prompt
 
 
+def test_system_prompt_explains_instant_kill_semantics() -> None:
+    """不告诉模型开火即毁, 它就会写出"先射、再回射"这种打不出来的计划。"""
+    llm = ScriptedLLM([_dumps(_valid_ir())])
+    ScenarioIRPlanner(llm=llm).plan("任务")
+    system_prompt = llm.calls[0][0]["content"]
+    assert "开火瞬间就摧毁目标" in system_prompt
+    assert "射击次数不超过它的 quantity" in system_prompt
+    # 实测只讲"先射再回射打不出"不够, 还要告诉它怎样让双方都开火
+    assert "在被击毁之前先打别的目标" in system_prompt
+    assert "同一秒互射" in system_prompt
+    # 只讲"每发都要打得出", 模型会把承担穿越、撤离航段的平台提前打掉
+    assert "此后的航点都不会飞到" in system_prompt
+    assert "engagement_id 和原因" in system_prompt
+
+
+class FinishReasonLLM(ScriptedLLM):
+    """按脚本同时给出 finish_reason 的假 LLM。"""
+
+    def __init__(
+        self, responses: list[tuple[str, str]], usages: list[dict | None] | None = None
+    ) -> None:
+        super().__init__([text for text, _ in responses])
+        self.reasons = [reason for _, reason in responses]
+        self.usages = usages or [None] * len(responses)
+        self.last_finish_reason: str | None = None
+        self.last_usage: dict | None = None
+
+    def chat(self, messages: list[dict], **kwargs: Any) -> str:
+        self.last_finish_reason = self.reasons[len(self.calls)]
+        self.last_usage = self.usages[len(self.calls)]
+        return super().chat(messages, **kwargs)
+
+
+# rerun 实测的 refine 轮: 推理吃掉 57424 / 65536, 正文只写出不到一半
+_THOUGHT_OUT_USAGE = {"completion_tokens": 65536, "completion_tokens_details": {"reasoning_tokens": 57424}}
+_LONG_IR_USAGE = {"completion_tokens": 65536, "completion_tokens_details": {"reasoning_tokens": 4000}}
+_PARTIAL_REPLY = '{"scenario_id": "unit_probe", "platforms": ['
+
+
+def _overlapping_ir() -> dict[str, Any]:
+    ir = _valid_ir()
+    ir["platforms"][1]["position"] = dict(ir["platforms"][0]["position"])
+    return ir
+
+
+def test_reasoning_exhausted_empty_reply_is_retried() -> None:
+    """推理模型把 max_tokens 全耗在思考上时正文为空; 推演长度每次不同, 值得催一次再试。"""
+    llm = FinishReasonLLM([("", "length"), (_dumps(_valid_ir()), "stop")])
+    result = ScenarioIRPlanner(llm=llm).plan("任务")
+
+    assert result.success
+    assert "推理过程耗尽了 max_tokens" in result.attempts[0].errors[-1]
+    retry = llm.calls[1]
+    assert [m["role"] for m in retry] == ["system", "user"]
+    assert retry[1]["content"].startswith(llm.calls[0][1]["content"])
+    assert "直接输出完整的 ScenarioIR JSON" in retry[1]["content"]
+
+
+@pytest.mark.parametrize("usage", [None, _LONG_IR_USAGE])
+def test_truncated_partial_reply_is_not_retried(usage: dict | None) -> None:
+    """正文写到一半被截断、推理又没占多少, 说明 IR 本身超预算, 同一预算下重试只会再截断。"""
+    llm = FinishReasonLLM([(_PARTIAL_REPLY, "length")], usages=[usage])
+    result = ScenarioIRPlanner(llm=llm).plan("任务")
+
+    assert not result.success
+    assert len(llm.calls) == 1
+    assert "上限被截断" in result.attempts[0].errors[-1]
+
+
+def test_reasoning_heavy_partial_refine_is_nudged_once() -> None:
+    """refine 轮推理吃掉大半预算、正文只写出一截: 催它少想, 带着同一份问题清单再试。"""
+    llm = FinishReasonLLM(
+        [(_dumps(_overlapping_ir()), "stop"), (_PARTIAL_REPLY, "length"), (_dumps(_valid_ir()), "stop")],
+        usages=[None, _THOUGHT_OUT_USAGE, None],
+    )
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=3).plan("任务")
+
+    assert result.success
+    assert result.advisories == []
+    assert "推理过程耗尽了 max_tokens" in result.attempts[1].errors[-1]
+    retry = llm.calls[2]
+    assert retry[-2] == llm.calls[1][-2]  # 回灌的仍是同一版 IR
+    assert retry[-1]["content"].startswith(llm.calls[1][-1]["content"])
+    # 修订轮的上一版就在对话里: 催它只输出补丁, 不再整份重抄
+    assert "只输出改动的补丁" in retry[-1]["content"]
+
+
+def test_repeated_thought_out_refine_keeps_best_without_more_retries() -> None:
+    """已有合法结果时只催一次: 再截断就停, 不为 refine 反复烧预算。"""
+    llm = FinishReasonLLM(
+        [(_dumps(_overlapping_ir()), "stop"), (_PARTIAL_REPLY, "length"), (_PARTIAL_REPLY, "length")],
+        usages=[None, _THOUGHT_OUT_USAGE, _THOUGHT_OUT_USAGE],
+    )
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=4).plan("任务")
+
+    assert result.success
+    assert len(llm.calls) == 3
+    assert any("初始位置完全相同" in a for a in result.advisories)
+
+
+# ── 需求核对轮 ───────────────────────────────────────────────────
+
+
+_REQUIREMENTS_MET = _dumps({"__requirements_met__": True})
+
+
+def _single_strike_payload(fire_time_s: float = 600.0) -> dict[str, Any]:
+    return _duel_payload([_engagement("strike", "blue_awacs", "red_radar", "aam", fire_time_s)])
+
+
+def test_audit_is_off_by_default() -> None:
+    llm = ScriptedLLM([_dumps(_valid_ir())])
+    result = ScenarioIRPlanner(llm=llm).plan("任务")
+    assert result.rounds == 1
+    assert result.requirements_audit == ""
+
+
+def test_audit_confirmation_ends_planning() -> None:
+    """通用检查清零后再问一轮; 模型确认需求都满足就保留原版, 不必重抄整份 IR。"""
+    llm = ScriptedLLM([_dumps(_single_strike_payload()), _REQUIREMENTS_MET])
+    result = ScenarioIRPlanner(llm=llm, audit_requirements=True).plan("蓝方 600 秒打击红方雷达")
+
+    assert result.success
+    assert [a.stage for a in result.attempts] == ["extract", "audit"]
+    assert result.requirements_audit == "met"
+    assert result.scenario_ir["engagements"][0]["fire_time_s"] == 600.0
+    audit_call = llm.calls[1]
+    assert audit_call[:2] == llm.calls[0]  # 原始需求仍在对话里
+    assert json.loads(audit_call[-2]["content"])["engagements"][0]["engagement_id"] == "strike"
+    assert "__requirements_met__" in audit_call[-1]["content"]
+
+
+def test_audit_prompt_carries_fact_sheet() -> None:
+    """对照需求所需的数字由代码算好: 航点时刻与坐标、开火斜距与结算、初始距离、存活数。"""
+    llm = ScriptedLLM([_dumps(_single_strike_payload()), _REQUIREMENTS_MET])
+    ScenarioIRPlanner(llm=llm, audit_requirements=True).plan("任务")
+
+    prompt = llm.calls[1][-1]["content"]
+    assert "数值约束" in prompt and "谁击毁谁" in prompt
+    assert "- blue_awacs [blue]: 初始 (27.500, 121.000, 9000m); 航点1 (27.600, 121.200, 9000m) 113s" in prompt
+    assert "- red_radar [red]: 初始 (27.500, 122.500, 0m); 无航路; 600s 被交战 strike 摧毁" in prompt
+    assert "- 600s strike: blue_awacs → red_radar; 开火时位置无法推算" in prompt
+    assert "- blue–red: 147.9km (blue_awacs ↔ red_radar)" in prompt
+    assert "- blue: 1/1" in prompt and "- red: 0/1" in prompt
+
+
+def test_fact_sheet_reports_fire_range_and_outcomes() -> None:
+    scenario = _duel_ir([
+        _engagement("strike", "blue_awacs", "red_radar", "aam", 100.0),
+        _engagement("reply", "red_radar", "blue_awacs", "sam", 110.0),
+        _engagement("again", "blue_awacs", "red_radar", "aam", 120.0),
+    ])
+    sheet = planner_module._fact_sheet(scenario)
+    assert "- 100s strike: blue_awacs → red_radar; 开火时斜距 " in sheet
+    assert "km; 摧毁目标" in sheet
+    assert "- 110s reply: red_radar → blue_awacs; 开火时位置无法推算" not in sheet
+    assert "reply: red_radar → blue_awacs; 开火时斜距" in sheet
+    assert "打不出: 射手已在 100s 被交战 strike 摧毁" in sheet
+    assert "again: blue_awacs → red_radar" in sheet and "被跳过: 目标已在 100s" in sheet
+
+
+def test_audit_revision_is_accepted_and_audited_again() -> None:
+    """核对轮发现需求没满足就输出修正版; 修正版问题不多于原版就接受, 并再核对一次。"""
+    llm = ScriptedLLM([
+        _dumps(_single_strike_payload(600.0)),
+        _dumps(_single_strike_payload(900.0)),
+        _REQUIREMENTS_MET,
+    ])
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=3, audit_requirements=True).plan(
+        "蓝方 900 秒打击红方雷达"
+    )
+
+    assert [a.stage for a in result.attempts] == ["extract", "audit", "audit"]
+    assert result.requirements_audit == "met"
+    assert result.scenario_ir["engagements"][0]["fire_time_s"] == 900.0
+    assert "- 900s strike" in llm.calls[2][-1]["content"]
+
+
+def test_audit_revision_with_new_issue_gets_one_refine_before_acceptance() -> None:
+    """按需求修正时引入了新问题: 先在修正版上 refine, 改干净了再接受, best 不提前被替换。"""
+    revised = _single_strike_payload(900.0)
+    revised_with_overlap = copy.deepcopy(revised)
+    revised_with_overlap["platforms"][1]["position"] = dict(revised["platforms"][0]["position"])
+    llm = ScriptedLLM([
+        _dumps(_single_strike_payload(600.0)),
+        _dumps(revised_with_overlap),
+        _dumps(revised),
+        _REQUIREMENTS_MET,
+    ])
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=4, audit_requirements=True).plan("任务")
+
+    assert [a.stage for a in result.attempts] == ["extract", "audit", "refine", "audit"]
+    refine_call = llm.calls[2]
+    assert json.loads(refine_call[-2]["content"])["engagements"][0]["fire_time_s"] == 900.0
+    assert "初始位置完全相同" in refine_call[-1]["content"]
+    assert result.requirements_audit == "met"
+    assert result.advisories == []
+    assert result.scenario_ir["engagements"][0]["fire_time_s"] == 900.0
+
+
+def test_audit_revision_that_stays_worse_keeps_the_audited_version() -> None:
+    worse = _single_strike_payload(900.0)
+    worse["platforms"][1]["position"] = dict(worse["platforms"][0]["position"])
+    llm = ScriptedLLM([_dumps(_single_strike_payload(600.0)), _dumps(worse), _dumps(worse)])
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=4, audit_requirements=True).plan("任务")
+
+    assert len(llm.calls) == 3  # 修正版没改好, 原版已核对过, 不再继续
+    assert result.advisories == []
+    assert result.scenario_ir["engagements"][0]["fire_time_s"] == 600.0
+    assert result.requirements_audit == "unconfirmed"
+
+
+def test_audit_revision_with_schema_slip_is_repaired_then_audited() -> None:
+    """实测: 核对轮把时刻改对了, 却顺手多写一个字段; 修掉 schema 错误后照常验收。"""
+    slipped = _single_strike_payload(900.0)
+    slipped["mission"]["assumptions_note"] = "蓝方改到 900 秒开火"
+    llm = ScriptedLLM([
+        _dumps(_single_strike_payload(600.0)),
+        _dumps(slipped),
+        _dumps(_single_strike_payload(900.0)),
+        _REQUIREMENTS_MET,
+    ])
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=4, audit_requirements=True).plan("任务")
+
+    assert [a.stage for a in result.attempts] == ["extract", "audit", "repair", "audit"]
+    assert "assumptions_note" in llm.calls[2][-1]["content"]
+    assert result.requirements_audit == "met"
+    assert result.scenario_ir["engagements"][0]["fire_time_s"] == 900.0
+
+
+def test_repaired_audit_revision_with_new_issue_still_gets_refined() -> None:
+    slipped = _single_strike_payload(900.0)
+    slipped["selected_coa"]["mission_id"] = "mismatched"
+    repaired_with_overlap = _single_strike_payload(900.0)
+    repaired_with_overlap["platforms"][1]["position"] = dict(
+        repaired_with_overlap["platforms"][0]["position"]
+    )
+    llm = ScriptedLLM([
+        _dumps(_single_strike_payload(600.0)),
+        _dumps(slipped),
+        _dumps(repaired_with_overlap),
+        _dumps(_single_strike_payload(900.0)),
+    ])
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=4, audit_requirements=True).plan("任务")
+
+    assert [a.stage for a in result.attempts] == ["extract", "audit", "repair", "refine"]
+    assert json.loads(llm.calls[3][-2]["content"])["engagements"][0]["fire_time_s"] == 900.0
+    assert result.scenario_ir["engagements"][0]["fire_time_s"] == 900.0
+    assert result.requirements_audit == "unconfirmed"  # 轮数用完, 最终版没再核对
+
+
+def test_null_extra_fields_are_dropped_before_validation() -> None:
+    """值为空的多余字段不携带信息, 确定性删掉, 不为它打回整版。"""
+    payload = _valid_ir()
+    payload["mission"]["assumptions_note"] = None
+    payload["platforms"][0]["comment"] = ""
+    result = ScenarioIRPlanner(llm=ScriptedLLM([_dumps(payload)])).plan("任务")
+
+    assert result.success and result.rounds == 1
+    assert any("mission.assumptions_note" in note for note in result.normalizations)
+    assert any("platforms.0.comment" in note for note in result.normalizations)
+    assert "assumptions_note" not in result.scenario_ir["mission"]
+
+
+def test_extra_field_duplicating_a_sibling_is_dropped() -> None:
+    """实测: 模型多写了 "coa_id_note": "coa_1", 值与 coa_id 一样, 删掉不丢信息。"""
+    payload = _valid_ir()
+    payload["selected_coa"]["coa_id_note"] = "coa_1"
+    result = ScenarioIRPlanner(llm=ScriptedLLM([_dumps(payload)])).plan("任务")
+
+    assert result.success and result.rounds == 1
+    assert any("selected_coa.coa_id_note" in note and "coa_id" in note
+               for note in result.normalizations)
+
+
+def test_extra_field_matching_sibling_only_loosely_is_kept() -> None:
+    """True == 1 在 Python 里成立, 但布尔与数字不是同一份信息。"""
+    payload = _valid_ir()
+    payload["mission"]["duration_s"] = 1
+    payload["mission"]["is_drill"] = True
+    normalized, _ = planner_module.normalize_ir_payload(payload)
+    assert normalized["mission"]["is_drill"] is True
+
+
+def test_non_null_extra_fields_are_left_for_the_validator() -> None:
+    payload = _valid_ir()
+    payload["mission"]["assumptions_note"] = "写在了不存在的字段里"
+    normalized, notes = planner_module.normalize_ir_payload(payload)
+
+    assert normalized["mission"]["assumptions_note"] == "写在了不存在的字段里"
+    assert not any("assumptions_note" in note for note in notes)
+
+
+def test_audit_without_rounds_left_is_skipped() -> None:
+    llm = ScriptedLLM([_dumps(_valid_ir())])
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=1, audit_requirements=True).plan("任务")
+    assert result.rounds == 1
+    assert result.requirements_audit == ""
+
+
+def test_audit_waits_until_generic_issues_are_cleared() -> None:
+    llm = ScriptedLLM([_dumps(_overlapping_ir()), _dumps(_valid_ir()), _REQUIREMENTS_MET])
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=3, audit_requirements=True).plan("任务")
+    assert [a.stage for a in result.attempts] == ["extract", "refine", "audit"]
+    assert result.requirements_audit == "met"
+
+
+def test_failed_audit_call_keeps_result_unconfirmed() -> None:
+    class TimeoutOnAudit(ScriptedLLM):
+        def chat(self, messages: list[dict], **kwargs: Any) -> str:
+            if self.calls:
+                raise TimeoutError("read timeout")
+            return super().chat(messages, **kwargs)
+
+    result = ScenarioIRPlanner(
+        llm=TimeoutOnAudit([_dumps(_valid_ir())]), audit_requirements=True
+    ).plan("任务")
+    assert result.success
+    assert result.requirements_audit == "unconfirmed"
+    assert result.attempts[-1].stage == "audit"
+
+
+def test_thought_out_audit_is_nudged_with_sentinel_reminder() -> None:
+    llm = FinishReasonLLM(
+        [(_dumps(_valid_ir()), "stop"), ("", "length"), (_REQUIREMENTS_MET, "stop")],
+        usages=[None, _THOUGHT_OUT_USAGE, None],
+    )
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=3, audit_requirements=True).plan("任务")
+
+    assert result.requirements_audit == "met"
+    retry = llm.calls[2][-1]["content"]
+    assert retry.startswith(llm.calls[1][-1]["content"])
+    assert "事实表里的数字都已算好" in retry
+
+
+async def test_tools_enable_audit_by_default(monkeypatch) -> None:
+    seen: list[bool] = []
+    result = ScenarioIRPlanner(llm=ScriptedLLM([_dumps(_valid_ir())])).plan("任务")
+
+    def fake_plan(self: ScenarioIRPlanner, *_: Any) -> Any:
+        seen.append(self.audit_requirements)
+        return result
+
+    monkeypatch.setattr(planner_module, "_make_llm", lambda _: None)
+    monkeypatch.setattr(ScenarioIRPlanner, "plan", fake_plan)
+    output = json.loads(await NLToAfsimTool().execute(request="任务", include_code=False))
+    await NLToAfsimTool().execute(request="任务", audit_requirements=False, include_code=False)
+
+    assert seen == [True, False]
+    assert output["requirements_audit"] == ""
+
+
 @pytest.mark.parametrize("field_name", ["scenario_id", "mission", "selected_coa", "platforms"])
 def test_ir_shape_documents_required_fields(field_name: str) -> None:
     llm = ScriptedLLM([_dumps(_valid_ir())])
     ScenarioIRPlanner(llm=llm).plan("任务")
     assert field_name in llm.calls[0][0]["content"]
+
+
+def _broken_project() -> dict[str, str]:
+    files = emit_project(ScenarioIR.model_validate(_valid_ir()))
+    name = next(path for path in files if path.startswith("platforms/"))
+    files[name] = files[name].replace("end_platform_type", "")
+    return files
+
+
+def test_planner_rejects_invalid_project_despite_valid_single_file(monkeypatch) -> None:
+    monkeypatch.setattr(planner_module, "emit_project", lambda _: _broken_project())
+    llm = ScriptedLLM([_dumps(_valid_ir())])
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=1).plan("预警机搜索红方雷达")
+    assert not result.success
+    assert any("platforms/" in error for error in result.attempts[0].errors)
+
+
+async def test_compile_tool_rejects_invalid_project_without_writing(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(planner_module, "emit_project", lambda _: _broken_project())
+    root = tmp_path / "new_project"
+    output = json.loads(await ScenarioCompileTool().execute(
+        scenario_ir_json=_dumps(_valid_ir()), output_path=str(root),
+    ))
+    assert not output["success"]
+    assert output["stage"] == "project_validation"
+    assert "platforms/" in output["errors"][0]
+    assert not root.exists()
+
+
+async def test_compile_tool_checks_project_even_without_output_path(monkeypatch) -> None:
+    monkeypatch.setattr(planner_module, "emit_project", lambda _: _broken_project())
+    output = json.loads(await ScenarioCompileTool().execute(scenario_ir_json=_dumps(_valid_ir())))
+    assert not output["success"]
+
+
+def test_project_writer_rejects_invalid_single_snapshot_before_writing(tmp_path: Path) -> None:
+    root = tmp_path / "new_project"
+    scenario = ScenarioIR.model_validate(_valid_ir())
+    text = AfsimCompiler().compile(scenario).replace("end_mover", "")
+    with pytest.raises(CompileError, match="快照"):
+        _write_project_output(str(root), scenario, text)
+    assert not root.exists()
+
+
+async def test_compile_tool_writes_validated_project_to_selected_directory(tmp_path: Path) -> None:
+    original = tmp_path / "air_8v8"
+    original.mkdir()
+    marker = original / "main.txt"
+    marker.write_text("原始对比稿", encoding="utf-8")
+    root = tmp_path / "air_8v8_qoder"
+    output = json.loads(await ScenarioCompileTool().execute(
+        scenario_ir_json=_dumps(_valid_ir()), output_path=str(root),
+    ))
+    assert output["success"]
+    assert output["project"]["validation"]["valid"]
+    assert output["project"]["validation"]["runtime_verified"] is False
+    assert output["project"]["validation"]["validator"]["errors"] == 0
+    assert Path(output["project"]["entry"]) == root / "main.txt"
+    assert (root / "scenario_single.txt").is_file()
+    assert marker.read_text(encoding="utf-8") == "原始对比稿"
+
+
+async def test_nl_tool_rejects_invalid_final_project_after_planning(monkeypatch, tmp_path: Path) -> None:
+    # 模拟规划成功后最终 emitter 出错，不能沿用规划阶段的 success=True。
+    result = ScenarioIRPlanner(llm=ScriptedLLM([_dumps(_valid_ir())])).plan("预警机搜索红方雷达")
+    assert result.success
+    monkeypatch.setattr(planner_module, "_make_llm", lambda _: None)
+    monkeypatch.setattr(ScenarioIRPlanner, "plan", lambda *_: result)
+    monkeypatch.setattr(planner_module, "emit_project", lambda _: _broken_project())
+    root = tmp_path / "new_project"
+    output = json.loads(await NLToAfsimTool().execute(request="预警机搜索红方雷达", output_path=str(root)))
+    assert not output["success"]
+    assert output["stage"] == "project_validation"
+    assert not root.exists()
+
+
+async def test_compile_tool_does_not_write_when_validator_reports_errors(monkeypatch, tmp_path: Path) -> None:
+    real_validator = planner_module._validator_report
+
+    def invalid_single(text: str) -> dict[str, Any]:
+        report = real_validator(text)
+        # 单文件带生成器头部，include 展开文本以项目头部开始。
+        if text.startswith("# Generated"):
+            report["errors"] = 1
+        return report
+
+    monkeypatch.setattr(planner_module, "_validator_report", invalid_single)
+    root = tmp_path / "new_project"
+    output = json.loads(await ScenarioCompileTool().execute(
+        scenario_ir_json=_dumps(_valid_ir()), output_path=str(root),
+    ))
+    assert not output["success"]
+    assert not root.exists()
+
+
+# ── 修订轮补丁 ───────────────────────────────────────────────────
+
+
+def _patch(body: Any) -> str:
+    return _dumps({"__patch__": body})
+
+
+def _restore_red_radar() -> dict[str, Any]:
+    """把 _overlapping_ir 里与蓝方重叠的红方雷达挪回原位。"""
+    return {"platforms": [
+        {"platform_id": "red_radar", "position": _valid_ir()["platforms"][1]["position"]}
+    ]}
+
+
+def test_patch_merges_objects_and_lists_by_id() -> None:
+    base = _single_strike_payload(600.0)
+    merged, errors = planner_module.apply_ir_patch(base, {
+        "mission": {"objective": "压制红方雷达", "assumptions": ["蓝方 900s 开火"]},
+        "selected_coa": {"summary": None},
+        "engagements": [{"engagement_id": "strike", "fire_time_s": 900.0}],
+        "platforms": [
+            {"platform_id": "red_radar", "position": {"altitude_m": 50.0}},
+            {"platform_id": "blue_awacs", "route": []},
+        ],
+    })
+
+    assert errors == []
+    assert merged["mission"]["objective"] == "压制红方雷达"
+    assert merged["mission"]["duration_s"] == 1800.0
+    assert merged["mission"]["assumptions"] == ["蓝方 900s 开火"]
+    assert "summary" not in merged["selected_coa"]
+    assert merged["engagements"] == [{**base["engagements"][0], "fire_time_s": 900.0}]
+    assert [p["platform_id"] for p in merged["platforms"]] == ["blue_awacs", "red_radar"]
+    assert merged["platforms"][1]["position"] == {
+        "latitude_deg": 27.5, "longitude_deg": 122.5, "altitude_m": 50.0,
+    }
+    assert merged["platforms"][0]["route"] == []  # 未登记的列表整体替换
+    assert merged["platforms"][0]["weapons"] == base["platforms"][0]["weapons"]
+    assert base["engagements"][0]["fire_time_s"] == 600.0  # 上一版不被改动
+
+
+def test_patch_appends_new_ids_and_deletes_marked_ones() -> None:
+    base = _duel_payload(_RETURN_FIRE)
+    late = _engagement("late", "blue_awacs", "red_radar", "aam", 900.0)
+    merged, errors = planner_module.apply_ir_patch(base, {"engagements": [
+        {"engagement_id": "strike", "__delete__": True},
+        late,
+    ]})
+
+    assert errors == []
+    assert [e["engagement_id"] for e in merged["engagements"]] == ["reply", "late"]
+    assert merged["engagements"][1] == late
+
+
+@pytest.mark.parametrize(("patch", "message"), [
+    ({"engagements": [{"fire_time_s": 900.0}]}, "缺少 engagement_id"),
+    ({"engagements": [{"engagement_id": "ghost", "__delete__": True}]}, "ghost 在上一版里不存在"),
+    ({"platforms": {"platform_id": "red_radar"}}, "platforms 应该是列表"),
+    ({"platforms": [{"platform_id": "blue_awacs", "weapons": [{"quantity": 4}]}]},
+     "platforms.weapons 的第 1 个元素缺少 instance_name"),
+    (["engagements"], "应该是对象"),
+])
+def test_ambiguous_patch_is_rejected_whole(patch: Any, message: str) -> None:
+    merged, errors = planner_module.apply_ir_patch(_single_strike_payload(), patch)
+    assert merged is None
+    assert any(message in error for error in errors)
+
+
+def test_refine_patch_is_merged_onto_the_previous_version() -> None:
+    llm = ScriptedLLM([_dumps(_overlapping_ir()), _patch(_restore_red_radar())])
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=2).plan("任务")
+
+    assert result.success and result.advisories == []
+    assert [a.patched for a in result.attempts] == [False, True]
+    assert result.scenario_ir["platforms"][1]["position"]["longitude_deg"] == 122.5
+    assert result.scenario_ir["assertions"] == _valid_ir()["assertions"]
+    refine_prompt = llm.calls[1][-1]["content"]
+    assert "__patch__" in refine_prompt and "按 id" in refine_prompt
+
+
+def test_patch_without_ids_is_repaired_against_the_previous_version() -> None:
+    position = _valid_ir()["platforms"][1]["position"]
+    llm = ScriptedLLM([
+        _dumps(_overlapping_ir()),
+        _patch({"platforms": [{"position": position}]}),
+        _patch(_restore_red_radar()),
+    ])
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=3).plan("任务")
+
+    assert [a.stage for a in result.attempts] == ["extract", "refine", "repair"]
+    assert "缺少 platform_id" in result.attempts[1].errors[0]
+    repair_call = llm.calls[2]
+    # 补丁合并不了: 回灌的是上一版, 模型对着它重写补丁
+    assert json.loads(repair_call[-2]["content"]) == json.loads(llm.calls[1][-2]["content"])
+    assert "缺少 platform_id" in repair_call[-1]["content"]
+    assert result.advisories == []
+
+
+def test_patch_without_a_previous_version_is_rejected() -> None:
+    llm = ScriptedLLM([_patch({"scenario_id": "x"}), _dumps(_valid_ir())])
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=2).plan("任务")
+
+    assert result.success
+    assert "没有上一版 IR" in result.attempts[0].errors[0]
+    assert "没有上一版 IR" in llm.calls[1][-1]["content"]
+
+
+def test_truncated_refine_rewrite_is_nudged_toward_a_patch() -> None:
+    """refine 轮推理没占多少却写到上限: 是整份重抄超了预算, 催它改输出补丁。"""
+    llm = FinishReasonLLM(
+        [(_dumps(_overlapping_ir()), "stop"), (_PARTIAL_REPLY, "length"),
+         (_patch(_restore_red_radar()), "stop")],
+        usages=[None, _LONG_IR_USAGE, None],
+    )
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=3).plan("任务")
+
+    assert result.success and result.advisories == []
+    assert "上限被截断" in result.attempts[1].errors[-1]
+    retry = llm.calls[2]
+    assert retry[-2] == llm.calls[1][-2]
+    assert retry[-1]["content"].startswith(llm.calls[1][-1]["content"])
+    assert "只输出改动的补丁" in retry[-1]["content"]
+    assert result.attempts[2].patched
+
+
+def test_audit_revision_can_be_a_patch() -> None:
+    llm = ScriptedLLM([
+        _dumps(_single_strike_payload(600.0)),
+        _patch({"engagements": [{"engagement_id": "strike", "fire_time_s": 900.0}]}),
+        _REQUIREMENTS_MET,
+    ])
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=3, audit_requirements=True).plan(
+        "蓝方 900 秒打击红方雷达"
+    )
+
+    assert [a.stage for a in result.attempts] == ["extract", "audit", "audit"]
+    assert result.requirements_audit == "met"
+    assert result.scenario_ir["engagements"][0]["fire_time_s"] == 900.0
+    assert result.attempts[1].patched
+    assert "__patch__" in llm.calls[1][-1]["content"]
+
+
+def test_schema_repair_accepts_a_patch() -> None:
+    broken = _valid_ir()
+    broken["selected_coa"]["mission_id"] = "mismatched"
+    llm = ScriptedLLM([_dumps(broken), _patch({"selected_coa": {"mission_id": "probe"}})])
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=2).plan("任务")
+
+    assert result.success and result.attempts[1].patched
+    assert "__patch__" in llm.calls[1][-1]["content"]
+
+
+# ── 需求数值条款 ─────────────────────────────────────────────────
+
+
+def _checks(*items: dict[str, Any]) -> str:
+    return _dumps({"checks": list(items)})
+
+
+_LATE_STRIKE = {
+    "kind": "fire_window", "shooters": ["blue_awacs"], "start_s": 900, "end_s": 1200,
+    "quote": "蓝方 900-1200 秒打击",
+}
+
+
+def test_requirement_checks_are_extracted_once_and_fed_into_refine() -> None:
+    llm = ScriptedLLM([
+        _dumps(_single_strike_payload(600.0)),
+        _checks(_LATE_STRIKE),
+        _patch({"engagements": [{"engagement_id": "strike", "fire_time_s": 950.0}]}),
+    ])
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=3, check_requirements=True).plan(
+        "蓝方 900-1200 秒打击红方雷达"
+    )
+
+    assert result.success and result.advisories == []
+    assert result.scenario_ir["engagements"][0]["fire_time_s"] == 950.0
+    # 条款抽取是单独一次调用, 不算修复轮
+    assert [a.stage for a in result.attempts] == ["extract", "refine"]
+    assert len(llm.calls) == 3
+    extract_call = llm.calls[1]
+    assert "条款抽取器" in extract_call[0]["content"]
+    assert "蓝方 900-1200 秒打击红方雷达" in extract_call[1]["content"]
+    assert "- blue_awacs [blue] 预警机" in extract_call[1]["content"]
+    first = result.attempts[0].advisories[0]
+    assert first.startswith("需求「蓝方 900-1200 秒打击」未满足") and "600s 开火" in first
+    assert "以\"需求\"开头" in llm.calls[2][-1]["content"]
+    assert result.requirement_checks == [_LATE_STRIKE]
+
+
+def test_requirement_check_extraction_failure_is_noted_not_fatal() -> None:
+    llm = ScriptedLLM([_dumps(_valid_ir()), "抽不出来"])
+    result = ScenarioIRPlanner(llm=llm, check_requirements=True).plan("任务")
+
+    assert result.success and result.rounds == 1
+    assert result.requirement_checks == []
+    assert any("无法解析" in note for note in result.requirement_notes)
+
+
+def test_invalid_or_unmatched_checks_are_dropped_with_notes() -> None:
+    llm = ScriptedLLM([
+        _dumps(_valid_ir()),
+        _checks({"kind": "fire_window", "shooters": ["ghost_*"], "end_s": 900}, {"kind": "teleport"}),
+    ])
+    result = ScenarioIRPlanner(llm=llm, check_requirements=True).plan("任务")
+
+    assert result.success and result.requirement_checks == []
+    assert len(result.requirement_notes) == 2
+
+
+def test_audit_prompt_lists_checks_already_verified_by_code() -> None:
+    passed = {
+        "kind": "fire_window", "shooters": ["blue_awacs"], "start_s": 500, "end_s": 700,
+        "quote": "蓝方 600 秒打击",
+    }
+    llm = ScriptedLLM([_dumps(_single_strike_payload(600.0)), _checks(passed), _REQUIREMENTS_MET])
+    result = ScenarioIRPlanner(llm=llm, audit_requirements=True, check_requirements=True).plan(
+        "蓝方 600 秒打击红方雷达"
+    )
+
+    assert result.requirements_audit == "met"
+    audit_prompt = llm.calls[2][-1]["content"]
+    assert "已由代码按当前 IR 核验通过" in audit_prompt
+    assert "「蓝方 600 秒打击」" in audit_prompt
+
+
+def test_extract_thought_out_retry_does_not_use_up_a_repair_round() -> None:
+    llm = FinishReasonLLM([
+        ("", "length"),
+        (_dumps(_overlapping_ir()), "stop"),
+        (_patch(_restore_red_radar()), "stop"),
+    ])
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=2).plan("任务")
+
+    assert result.success and result.advisories == []
+    assert [a.stage for a in result.attempts] == ["extract", "extract", "refine"]
+
+
+async def test_tools_enable_requirement_checks_by_default(monkeypatch) -> None:
+    seen: list[bool] = []
+    result = ScenarioIRPlanner(llm=ScriptedLLM([_dumps(_valid_ir())])).plan("任务")
+
+    def fake_plan(self: ScenarioIRPlanner, *_: Any) -> Any:
+        seen.append(self.check_requirements)
+        return result
+
+    monkeypatch.setattr(planner_module, "_make_llm", lambda _: None)
+    monkeypatch.setattr(ScenarioIRPlanner, "plan", fake_plan)
+    output = json.loads(await NLToAfsimTool().execute(request="任务", include_code=False))
+    await NLToAfsimTool().execute(request="任务", check_requirements=False, include_code=False)
+
+    assert seen == [True, False]
+    assert output["requirement_checks"] == [] and output["requirement_notes"] == []
+
+
+def test_extraction_prompt_maps_phase_windows_to_checks() -> None:
+    """实测: 需求只按阶段给时段, 模型就漏抽"至少 3 个交战时段"和"穿越落在哪个阶段"。"""
+    prompt = planner_module._REQUIREMENT_CHECKS_PROMPT
+    assert "fire_phases 的 windows" in prompt and "reach_area 的 start_s/end_s" in prompt
+
+
+# ── 漏写闭合符 ───────────────────────────────────────────────────
+
+
+def test_missing_closers_are_added_only_when_safe() -> None:
+    assert _parse_json_object('{"a": {"b": [1]}', close_unbalanced=True) == ({"a": {"b": [1]}}, [])
+    assert _parse_json_object('{"a": {"b": [1]}')[0] is None  # 默认不补
+    for text in (
+        '{"a": {"b": "未闭合',            # 停在字符串中间
+        '{"a": {"b": [1',                 # 不以闭合符结尾
+        '{"a": {"b": {"c": {"d": 1}',     # 缺得太多
+        '{"a": [1}}',                     # 闭合符配不上
+    ):
+        assert _parse_json_object(text, close_unbalanced=True)[0] is None, text
+
+
+def test_finished_patch_missing_its_last_brace_is_merged() -> None:
+    """rerun 实测: 核对轮补丁正常收尾却漏了最外层 "}", 整轮被丢。"""
+    llm = FinishReasonLLM([
+        (_dumps(_overlapping_ir()), "stop"),
+        (_patch(_restore_red_radar())[:-1], "stop"),
+    ])
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=2).plan("任务")
+
+    assert result.success and result.advisories == []
+    assert result.attempts[1].ok and result.attempts[1].patched
+
+
+def test_truncated_reply_is_not_closed() -> None:
+    """截断的输出哪怕恰好停在闭合符后也不补: 后面还有没写出来的内容。"""
+    llm = FinishReasonLLM([(_dumps(_valid_ir())[:-1], "length")])
+    result = ScenarioIRPlanner(llm=llm).plan("任务")
+    assert not result.success
+    assert "上限被截断" in result.attempts[0].errors[-1]

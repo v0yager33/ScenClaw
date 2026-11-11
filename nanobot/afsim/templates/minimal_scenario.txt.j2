@@ -2,6 +2,10 @@
 # scenario_id: {{ scenario.scenario_id }}
 # mission_id: {{ scenario.mission.mission_id }}
 
+radar_signature 10dB_FuzzBall WSF_RADAR_SIGNATURE
+   constant 10 dBsm
+end_radar_signature
+
 {% for sensor in scenario.sensors %}
 sensor {{ sensor.sensor_type_id }} {{ sensor.base_type }}
    mode_template
@@ -19,7 +23,7 @@ sensor {{ sensor.sensor_type_id }} {{ sensor.base_type }}
 end_sensor
 
 {% endfor %}
-{% if scenario.engagements %}
+{% if has_weapons %}
 weapon_effects AUTO_ENGAGEMENT_EFFECT WSF_SPHERICAL_LETHALITY
    maximum_damage 1
    minimum_damage 0.99
@@ -29,28 +33,25 @@ end_weapon_effects
 
 {% endif %}
 {% for platform_type, mover_type in unique_types %}
-platform_type {{ platform_type }}
+platform_type {{ platform_type }} WSF_PLATFORM
 {% if mover_type %}
    mover {{ mover_type }}
+   end_mover
 {% endif %}
    radar_signature 10dB_FuzzBall
-      constant 10 dBsm
-   end_radar_signature
 end_platform_type
 
 {% endfor %}
 {% for platform in scenario.platforms %}
-platform {{ platform.platform_id }} {{ platform.platform_type }}
+platform {{ platform.platform_id }} {{ platform | platform_type_key }}
    side {{ platform.side.value }}
    position {{ platform.position | position }} heading {{ platform.heading_deg | number }} deg
-{% if platform.mover_type %}
-   add mover {{ platform.mover_type }}
-   end_mover
-{% endif %}
 {% for sensor in platform.sensors %}
    add sensor {{ sensor.instance_name }} {{ sensor.sensor_type_id }}
 {% if sensor.enabled %}
       on
+{% else %}
+      off
 {% endif %}
       initial_mode {{ sensor.initial_mode }}
    end_sensor
@@ -71,9 +72,7 @@ platform {{ platform.platform_id }} {{ platform.platform_type }}
 {% endif %}
 {% for engagement in scenario.engagements %}
 {% if engagement.shooter_platform == platform.platform_id %}
-   execute at_time {{ engagement.fire_time_s | number }} sec absolute
-      Weapon("{{ engagement.weapon_name }}").Fire(WsfSimulation.FindPlatform("{{ engagement.target_platform }}").MakeTrack());
-   end_execute
+{{ engagement | fire_script }}
 {% endif %}
 {% endfor %}
 end_platform

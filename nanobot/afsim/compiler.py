@@ -11,7 +11,7 @@ from .capabilities import (
     CapabilityKind,
     CapabilityRegistry,
 )
-from .schemas import GeoPoint, RoutePointIR, ScenarioIR
+from .schemas import GeoPoint, PlatformIR, RoutePointIR, ScenarioIR, ScheduledEngagementIR
 
 
 class CompileError(ValueError):
@@ -77,6 +77,47 @@ def _route_position(point: RoutePointIR) -> str:
     return value
 
 
+def _platform_type_key(platform: PlatformIR) -> str:
+    """统一两种输出的类型名；IR 型号是标签，不是已加载的 AFSIM 父类型。"""
+    if platform.mover_type:
+        suffix = platform.mover_type.removeprefix("WSF_").removesuffix("_MOVER")
+        return f"{platform.platform_type}_{suffix}"
+    if platform.platform_type.startswith("WSF_"):
+        return f"{platform.platform_type}_STATIC"
+    return platform.platform_type
+
+
+def _fire_script(engagement: ScheduledEngagementIR) -> str:
+    """定时开火脚本；目标已被删除时跳过，不向 MakeTrack/Fire 传空引用。
+
+    即时效应武器命中后目标平台会被移出仿真。多个射手攻击同一目标时, 后执行的
+    ``FindPlatform`` 返回空引用, 直接链式调用 ``MakeTrack()`` 会触发 Script Exception。
+    判空写法与真实语料 ``prdata/rules_utils.txt`` 中的
+    ``WsfPlatform target_plat = WsfSimulation.FindPlatform(...)`` / ``IsValid()`` 一致。
+    """
+    return "\n".join([
+        f"   execute at_time {_number(engagement.fire_time_s)} sec absolute",
+        f'      WsfPlatform target_plat = WsfSimulation.FindPlatform("{engagement.target_platform}");',
+        "      if (target_plat.IsValid())",
+        "      {",
+        f'         Weapon("{engagement.weapon_name}").Fire(target_plat.MakeTrack());',
+        "      }",
+        "   end_execute",
+    ])
+
+
+def _platform_types(scenario: ScenarioIR) -> dict[str, tuple[str, str | None]]:
+    """按型号和 mover 去重，并拒绝不同配置映射到同一个类型名。"""
+    types: dict[str, tuple[str, str | None]] = {}
+    for platform in scenario.platforms:
+        key = _platform_type_key(platform)
+        spec = (platform.platform_type, platform.mover_type)
+        if key in types and types[key] != spec:
+            raise CompileError(f"platform type name collision: {key}")
+        types[key] = spec
+    return types
+
+
 class AfsimCompiler:
     """Compile the deliberately small, validated MVP subset of ScenarioIR."""
 
@@ -98,6 +139,8 @@ class AfsimCompiler:
             number=_number,
             position=_position,
             route_position=_route_position,
+            platform_type_key=_platform_type_key,
+            fire_script=_fire_script,
         )
         self._capability_registry = capability_registry
 
@@ -154,14 +197,14 @@ class AfsimCompiler:
         # 预计算唯一的 (platform_type, mover_type) 对, 让模板在实例化之前先声明类型。
         # 否则 linter 会报 "unknown platform type KJ500" (单文件模板之前靠默认值
         # WSF_PLATFORM 蒙混过关, 归一化层把默认值替换成具体类型后这个潜伏的 bug 就露出来了)。
-        unique_types: list[tuple[str, str | None]] = []
-        seen: set[tuple[str, str | None]] = set()
-        for platform in scenario.platforms:
-            key = (platform.platform_type, platform.mover_type)
-            if key not in seen:
-                seen.add(key)
-                unique_types.append(key)
-        return template.render(scenario=scenario, unique_types=unique_types)
+        unique_types = [
+            (key, mover) for key, (_, mover) in _platform_types(scenario).items()
+        ]
+        return template.render(
+            scenario=scenario,
+            unique_types=unique_types,
+            has_weapons=any(platform.weapons for platform in scenario.platforms),
+        )
 
 
 def compile_scenario(scenario: ScenarioIR) -> str:

@@ -206,6 +206,27 @@ def test_unregistered_wsf_type_reported_once_per_line_as_warning() -> None:
     assert hits[0].severity == "warning"
 
 
+def test_declared_wsf_prefixed_platform_type_is_not_an_unknown_base() -> None:
+    code = (
+        "platform_type WSF_PLATFORM_AIR WSF_PLATFORM\n"
+        "   mover WSF_AIR_MOVER\n   end_mover\nend_platform_type\n"
+        "platform alpha WSF_PLATFORM_AIR\nend_platform\nend_time 100 sec\n"
+    )
+    result = ScenarioValidator(code).validate_all()
+    assert result.errors == 0
+    assert not any(i.rule_id == "SYN_003" for i in result.issues)
+
+
+def test_undefined_wsf_prefixed_base_still_warns_for_custom_declaration() -> None:
+    code = (
+        "platform_type WSF_CUSTOM WSF_UNKNOWN_PARENT\nend_platform_type\n"
+        "platform alpha WSF_CUSTOM\nend_platform\nend_time 100 sec\n"
+    )
+    hits = [i for i in ScenarioValidator(code).validate_all().issues if i.rule_id == "SYN_003"]
+    assert len(hits) == 1
+    assert "WSF_UNKNOWN_PARENT" in hits[0].description
+
+
 # ── 确定性编译器与验证器口径一致 ────────────────────────────────────
 
 

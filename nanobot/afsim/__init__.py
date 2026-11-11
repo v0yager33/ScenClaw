@@ -27,17 +27,26 @@ from nanobot.afsim.capabilities import (
     Evidence,
 )
 from nanobot.afsim.compiler import AfsimCompiler, CompileError, compile_scenario
-from nanobot.afsim.project_emitter import emit_project, write_project
 from nanobot.afsim.geometry import (
     GeometryFinding,
     check_geometry,
     ground_distance_m,
     min_separation_m,
+    position_at,
     route_duration_s,
     route_length_m,
     slant_range_m,
+    waypoint_times_s,
 )
-from nanobot.afsim.linter import LintDiagnostic, LintResult, Severity, lint_afsim
+from nanobot.afsim.linter import (
+    LintDiagnostic,
+    LintResult,
+    Severity,
+    expand_project,
+    lint_afsim,
+    lint_project,
+)
+from nanobot.afsim.project_emitter import emit_project, write_project
 from nanobot.afsim.provenance import SourceKind, TrustLevel, ValidationStatus
 from nanobot.afsim.schemas import (
     COA,
@@ -96,11 +105,15 @@ __all__ = [
     "check_geometry",
     "compile_scenario",
     "emit_project",
+    "expand_project",
     "ground_distance_m",
     "lint_afsim",
+    "lint_project",
     "min_separation_m",
+    "position_at",
     "route_duration_s",
     "route_length_m",
     "slant_range_m",
+    "waypoint_times_s",
     "write_project",
 ]

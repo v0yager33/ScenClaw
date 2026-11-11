@@ -23,7 +23,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from nanobot.afsim.schemas import GeoPoint, PlatformIR, ScenarioIR
+from nanobot.afsim.schemas import GeoPoint, PlatformIR, ScenarioIR, ScheduledEngagementIR
 
 EARTH_RADIUS_M = 6_371_008.8
 
@@ -33,6 +33,9 @@ _MAX_SAMPLES_PER_LEG = 256
 
 # 判定"绝对不可达"时的安全余量, 吸收采样误差与地球模型误差
 _SAFETY_MARGIN_M = 2 * _SAMPLE_STEP_M
+
+# 按时刻推算位置时的余量: 匀速推算忽略转弯半径和加减速, 误差比纯几何采样大
+_TIMING_MARGIN_M = 10_000.0
 
 
 def ground_distance_m(a: GeoPoint, b: GeoPoint) -> float:
@@ -119,6 +122,48 @@ def route_duration_s(platform: PlatformIR, default_speed_mps: float = 0.0) -> fl
             return None
         total += ground_distance_m(start, end) / speed
     return total
+
+
+def position_at(platform: PlatformIR, time_s: float) -> GeoPoint | None:
+    """按各航段速度匀速推算平台在 ``time_s`` 秒时的位置。
+
+    忽略转弯半径和加减速, 只适合开火时刻这类粗粒度判定。静止平台返回初始位置;
+    航段缺速度, 或时刻已过航路终点 (之后怎么飞不由 IR 决定) 时返回 None。
+    """
+    if not platform.route:
+        return platform.position
+    start = platform.position
+    elapsed = 0.0
+    speed = 0.0
+    for point in platform.route:
+        if point.speed_mps:
+            speed = point.speed_mps
+        if speed <= 0:
+            return None
+        leg_s = ground_distance_m(start, point.position) / speed
+        if time_s <= elapsed + leg_s:
+            fraction = (time_s - elapsed) / leg_s if leg_s > 0 else 1.0
+            return _interpolate(start, point.position, max(0.0, fraction))
+        elapsed += leg_s
+        start = point.position
+    return None
+
+
+def waypoint_times_s(platform: PlatformIR) -> list[float] | None:
+    """按各航段速度匀速推算到达每个航路点的时刻 (秒); 有航段缺速度时返回 None。"""
+    start = platform.position
+    elapsed = 0.0
+    speed = 0.0
+    times: list[float] = []
+    for point in platform.route:
+        if point.speed_mps:
+            speed = point.speed_mps
+        if speed <= 0:
+            return None
+        elapsed += ground_distance_m(start, point.position) / speed
+        times.append(elapsed)
+        start = point.position
+    return times
 
 
 def min_separation_m(first: PlatformIR, second: PlatformIR) -> float:
@@ -249,14 +294,20 @@ def _check_routes(scenario: ScenarioIR) -> list[GeometryFinding]:
             )
             continue
         if needed > duration:
+            # 修法所需的数字直接算给模型: 推理模型在思考里逐条重算航程, 实测会耗尽输出预算
+            length = route_length_m(platform)
+            times = waypoint_times_s(platform) or []
+            reached = sum(1 for t in times if t <= duration)
             findings.append(
                 GeometryFinding(
                     kind="route_exceeds_duration",
                     message=(
                         f"平台 {platform.platform_id} 航路全长约 "
-                        f"{route_length_m(platform) / 1000:.0f} km, 按给定速度需要 "
+                        f"{length / 1000:.0f} km, 按给定速度需要 "
                         f"{needed / 60:.0f} 分钟, 超过任务时长 {duration / 60:.0f} 分钟, "
-                        f"后段航路不会被走到。请缩短航路、提高速度或延长 duration_s"
+                        f"到 {duration:.0f}s 时只飞完前 {reached}/{len(times)} 个航点, "
+                        f"后段航路不会被走到。全程走完平均速度至少要 {length / duration:.0f} m/s; "
+                        f"请缩短航路、提高速度或延长 duration_s"
                     ),
                 )
             )
@@ -269,7 +320,12 @@ def _check_engagements(
     sensor_range: dict[str, float],
     unmodelled: set[str],
 ) -> list[GeometryFinding]:
-    """交战必须有探测支撑: 射手一方得有传感器真的够得着目标。"""
+    """交战必须有探测支撑: 射手一方得有传感器真的够得着目标。
+
+    先查全程 (不看时间同步) 是否够得着; 够得着的再按开火时刻的推算位置复查一次。
+    定时开火不看探测结果, 而 WSF_IMPLICIT_WEAPON 也不按距离判定命中: 开火时目标在探测圈外,
+    这一发照样摧毁一个谁也看不见的目标, 想定跑得通, 只是结果失真。
+    """
     findings: list[GeometryFinding] = []
     for engagement in scenario.engagements:
         shooter = by_id.get(engagement.shooter_platform)
@@ -311,4 +367,101 @@ def _check_engagements(
                     ),
                 )
             )
+            continue
+
+        finding = _check_fire_time_detection(
+            engagement, shooter, target, friendly, sensor_range, scenario.mission.duration_s
+        )
+        if finding is not None:
+            findings.append(finding)
     return findings
+
+
+def _detection_windows(
+    target: PlatformIR,
+    friendly: list[PlatformIR],
+    sensor_range: dict[str, float],
+    duration_s: float,
+) -> list[tuple[float, float]]:
+    """按航路匀速推算, 我方至少一个传感器够得着目标的时段 (秒)。
+
+    航路飞完后位置推算不出, 这些时刻按够不着算。只用来给修复提示, 不参与判定。
+    """
+    step = max(10.0, duration_s / 360)
+    windows: list[tuple[float, float]] = []
+    opened: float | None = None
+    last = 0.0
+    moment = 0.0
+    while moment <= duration_s:
+        if _covered_at(moment, target, friendly, sensor_range):
+            if opened is None:
+                opened = moment
+            last = moment
+        elif opened is not None:
+            windows.append((opened, last))
+            opened = None
+        moment += step
+    if opened is not None:
+        windows.append((opened, last))
+    return windows
+
+
+def _covered_at(
+    moment: float,
+    target: PlatformIR,
+    friendly: list[PlatformIR],
+    sensor_range: dict[str, float],
+) -> bool:
+    target_at = position_at(target, moment)
+    if target_at is None:
+        return False
+    for platform in friendly:
+        observer_at = position_at(platform, moment)
+        if observer_at is None:
+            continue
+        if slant_range_m(observer_at, target_at) <= _platform_sensor_reach(platform, sensor_range):
+            return True
+    return False
+
+
+def _check_fire_time_detection(
+    engagement: ScheduledEngagementIR,
+    shooter: PlatformIR,
+    target: PlatformIR,
+    friendly: list[PlatformIR],
+    sensor_range: dict[str, float],
+    duration_s: float,
+) -> GeometryFinding | None:
+    """开火时刻我方是否至少有一个传感器够得着目标; 位置推算不出来就不报。"""
+    moment = engagement.fire_time_s
+    target_at = position_at(target, moment)
+    if target_at is None:
+        return None
+    best: tuple[float, str, float, float] | None = None
+    for platform in friendly:
+        observer_at = position_at(platform, moment)
+        if observer_at is None:
+            return None  # 有一方位置不确定, 不能断言够不到
+        reach = _platform_sensor_reach(platform, sensor_range)
+        separation = slant_range_m(observer_at, target_at)
+        if best is None or reach - separation > best[0]:
+            best = (reach - separation, platform.platform_id, separation, reach)
+    if best is None or best[0] + _TIMING_MARGIN_M >= 0:
+        return None
+    _, observer, separation, reach = best
+    # 可探测时段由代码算好: 让模型在思考里按航速逐个推算交会时刻, 实测会耗尽输出预算
+    windows = _detection_windows(target, friendly, sensor_range, duration_s)
+    if windows:
+        spans = "、".join(f"{start:.0f}-{end:.0f}s" for start, end in windows[:3])
+        advice = f"按当前航路, 我方能探测到它的时段是 {spans}; 请把开火时刻调进这些时段, 或调整航路"
+    else:
+        advice = "按当前航路, 任务时长内我方都探测不到它 (航路飞完后的位置不计); 请调整航路"
+    return GeometryFinding(
+        kind="engagement_out_of_detection_at_fire_time",
+        message=(
+            f"交战 {engagement.engagement_id} 在 {moment:.0f}s 开火时, 按航路匀速推算 "
+            f"{shooter.side.value} 方所有传感器都够不到 {target.platform_id}: 覆盖最好的 {observer} "
+            f"相距约 {separation / 1000:.0f} km, 探测距离只有 {reach / 1000:.0f} km。"
+            f"定时开火不管目标是否被探测到, 这一发会打向我方看不见的目标。{advice}"
+        ),
+    )

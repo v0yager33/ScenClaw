@@ -20,11 +20,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 
 from nanobot.afsim import (
     AfsimCompiler,
+    CompileError,
     ScenarioIR,
     emit_project,
+    expand_project,
+    lint_afsim,
+    lint_project,
     write_project,
 )
 from nanobot.afsim.schemas import (
@@ -36,6 +41,7 @@ from nanobot.afsim.schemas import (
     PlatformSensorIR,
     PlatformWeaponIR,
     RoutePointIR,
+    ScheduledEngagementIR,
     SensorIR,
     Side,
 )
@@ -160,10 +166,11 @@ def test_emit_project_platform_type_file_content() -> None:
     # 类型文件名现在按 mover 分家: J20 + WSF_AIR_MOVER -> J20_AIR
     platform_file = files["platforms/J20_AIR.txt"]
     # 必须是合法的 platform_type 定义
-    assert "platform_type J20_AIR" in platform_file
-    # mover 在 platform_type 里是单行引用 (与官方 demo 一致), 不带 end_mover
-    assert "mover WSF_AIR_MOVER" in platform_file
-    assert "end_mover" not in platform_file
+    assert "platform_type J20_AIR WSF_PLATFORM" in platform_file
+    assert "mover WSF_AIR_MOVER\n   end_mover" in platform_file
+    assert "end_platform_type" in platform_file
+    assert "constant" not in platform_file
+    assert "end_radar_signature" not in platform_file
     # 类型定义里不该有实例层面的东西 (位置/航路)
     assert "position" not in platform_file
     assert "route" not in platform_file
@@ -236,8 +243,15 @@ def test_different_movers_split_into_separate_files() -> None:
     WSF_PLATFORM_AIR.txt。修复后应该按 (platform_type, mover_type) 分家。
     """
     from nanobot.afsim.schemas import (
-        COA, GeoPoint, MissionSpec, PlatformIntent, PlatformIR,
-        PlatformSensorIR, RoutePointIR, SensorIR, Side,
+        COA,
+        GeoPoint,
+        MissionSpec,
+        PlatformIntent,
+        PlatformIR,
+        PlatformSensorIR,
+        RoutePointIR,
+        SensorIR,
+        Side,
     )
 
     # 构造 3 个平台: 同一基型 WSF_PLATFORM, 不同 mover
@@ -304,8 +318,8 @@ def test_different_movers_split_into_separate_files() -> None:
     platform_files = sorted(k for k in files if k.startswith("platforms/"))
     # 必须拆成 3 个文件: AIR / SURFACE / 无 mover
     assert platform_files == [
-        "platforms/WSF_PLATFORM.txt",          # 无 mover (固定)
         "platforms/WSF_PLATFORM_AIR.txt",      # 空中
+        "platforms/WSF_PLATFORM_STATIC.txt",   # 无 mover (固定)
         "platforms/WSF_PLATFORM_SURFACE.txt",  # 水面
     ]
 
@@ -313,13 +327,23 @@ def test_different_movers_split_into_separate_files() -> None:
     assert "mover WSF_AIR_MOVER" in files["platforms/WSF_PLATFORM_AIR.txt"]
     assert "mover WSF_SURFACE_MOVER" in files["platforms/WSF_PLATFORM_SURFACE.txt"]
     # 固定设施文件里不该有 mover 块
-    assert "mover" not in files["platforms/WSF_PLATFORM.txt"]
+    assert "mover" not in files["platforms/WSF_PLATFORM_STATIC.txt"]
+    assert "platform_type WSF_PLATFORM_STATIC WSF_PLATFORM" in files["platforms/WSF_PLATFORM_STATIC.txt"]
 
     # main.txt 里每个实例引用正确的类型键
     main = files["main.txt"]
     assert "platform blue_h6k_1 WSF_PLATFORM_AIR" in main
     assert "platform red_cg_1 WSF_PLATFORM_SURFACE" in main
-    assert "platform red_radar_1 WSF_PLATFORM" in main
+    assert "platform red_radar_1 WSF_PLATFORM_STATIC" in main
+    single = AfsimCompiler().compile(scenario)
+    assert lint_project(files).is_valid
+    assert lint_afsim(single).is_valid
+    for platform_id, key in (
+        ("blue_h6k_1", "WSF_PLATFORM_AIR"),
+        ("red_cg_1", "WSF_PLATFORM_SURFACE"),
+        ("red_radar_1", "WSF_PLATFORM_STATIC"),
+    ):
+        assert f"platform {platform_id} {key}" in single
 
 
 # ── include 闭合 ─────────────────────────────────────────────────────
@@ -381,7 +405,10 @@ def test_project_and_single_file_compile_same_scenario(tmp_path: Path) -> None:
     scenario = _minimal_scenario()
     single = AfsimCompiler().compile(scenario)
     files = emit_project(scenario)
-    concatenated = "\n".join(files[k] for k in sorted(files))
+    concatenated, _, errors = expand_project(files)
+    assert not errors
+    assert lint_project(files).is_valid
+    assert lint_afsim(single).is_valid
 
     # 关键构造都得在。注意单文件模板把 weapon_effects 命名为 AUTO_ENGAGEMENT_EFFECT,
     # 项目也沿用这个名字 (与武器类型名 WSF_IMPLICIT_WEAPON 不同概念)。
@@ -395,12 +422,21 @@ def test_project_and_single_file_compile_same_scenario(tmp_path: Path) -> None:
         "maximum_range 200000 m",
     ):
         assert token in concatenated, f"project missing {token!r}"
+        assert token in single, f"single file missing {token!r}"
 
-    # weapon_effects: 两边都引用 AUTO_ENGAGEMENT_EFFECT; 项目里还必须有定义块
-    # (单文件模板有个潜伏的 bug: 只引用不定义, 真机跑会报 undefined。这里不修它,
-    # 只断言 project 比单文件更完整)
-    assert "weapon_effects AUTO_ENGAGEMENT_EFFECT" in single
-    assert "weapon_effects AUTO_ENGAGEMENT_EFFECT WSF_SPHERICAL_LETHALITY" in concatenated
+    # 有武器但没有 engagements 时，两种输出也必须定义效应。
+    effect = "weapon_effects AUTO_ENGAGEMENT_EFFECT WSF_SPHERICAL_LETHALITY"
+    assert single.count(effect) == concatenated.count(effect) == 1
+    assert "add mover" not in single
+
+    def commands(text: str) -> list[str]:
+        return [
+            line.strip().replace("file output/", "file ")
+            for line in text.splitlines()
+            if line.strip() and not line.strip().startswith(("#", "//", "file_path", "log_file"))
+        ]
+
+    assert commands(single) == commands(concatenated)
 
     # 单文件里出现 1 次的, project 里也得出现 1 次 (类型定义不重复)
     assert single.count("sensor J20_RADAR WSF_GEOMETRIC_SENSOR") == 1
@@ -419,3 +455,243 @@ def test_project_main_passes_validator_on_its_own() -> None:
     errors = [i for i in result.issues if i.severity == "error"]
     # 不该有"类型未定义"的硬错 (CON_001 在带 include 时降级为 warning)
     assert not any("undefined type" in i.description.lower() for i in errors)
+
+
+def test_common_defines_shared_signature_before_includes() -> None:
+    files = emit_project(_minimal_scenario())
+    common = files["_common.txt"]
+    definition = "radar_signature 10dB_FuzzBall WSF_RADAR_SIGNATURE"
+    assert common.count(definition) == 1
+    assert common.index("end_radar_signature") < common.index("include_once")
+    assert AfsimCompiler().compile(_minimal_scenario()).count(definition) == 1
+
+
+@pytest.mark.parametrize("end", ["end_platform_type", "end_mover"])
+def test_project_detects_unclosed_included_type_with_source(end: str) -> None:
+    files = emit_project(_minimal_scenario())
+    name = "platforms/J20_AIR.txt"
+    files[name] = files[name].replace(end, "")
+    result = lint_project(files)
+    assert not result.is_valid
+    assert any(d.file == name and d.line for d in result.diagnostics)
+
+
+@pytest.mark.parametrize("missing", ["sensors/J20_RADAR.txt", "platforms/J20_AIR.txt"])
+def test_project_rejects_missing_transitive_include(missing: str) -> None:
+    files = emit_project(_minimal_scenario())
+    del files[missing]
+    result = lint_project(files)
+    assert not result.is_valid
+    assert any(d.code == "include.missing" and d.file == "_common.txt" for d in result.diagnostics)
+
+
+def test_project_expands_include_once_only_once() -> None:
+    files = emit_project(_minimal_scenario())
+    files["main.txt"] += "\ninclude_once _common.txt\n"
+    assert lint_project(files).is_valid
+    text, _, errors = expand_project(files)
+    assert not errors
+    assert text.count("platform_type J20_AIR WSF_PLATFORM") == 1
+
+
+def test_project_rejects_include_cycles_and_unsafe_paths() -> None:
+    files = emit_project(_minimal_scenario())
+    files["_common.txt"] += "\ninclude main.txt\n"
+    assert any(d.code == "include.cycle" for d in lint_project(files).diagnostics)
+    files["_common.txt"] = "include_once ../other.txt\n"
+    assert any(d.code == "include.invalid_path" for d in lint_project(files).diagnostics)
+
+
+@pytest.mark.parametrize("mutation,code", [
+    (lambda text: text.replace(" WSF_PLATFORM", ""), "platform_type.missing_parent"),
+    (lambda text: text.replace("10dB_FuzzBall", "UNKNOWN_SIG"), "radar_signature.undefined"),
+    (lambda text: text + text, "platform_type.duplicate"),
+])
+def test_project_rejects_bad_type_declarations(mutation, code: str) -> None:
+    files = emit_project(_minimal_scenario())
+    name = "platforms/J20_AIR.txt"
+    files[name] = mutation(files[name])
+    assert any(d.code == code for d in lint_project(files).diagnostics)
+
+
+def test_project_rejects_signature_definition_reference_mix() -> None:
+    files = emit_project(_minimal_scenario())
+    name = "platforms/J20_AIR.txt"
+    files[name] = files[name].replace(
+        "   radar_signature 10dB_FuzzBall",
+        "   radar_signature 10dB_FuzzBall\n      constant 10 dBsm\n   end_radar_signature",
+    )
+    result = lint_project(files)
+    assert not result.is_valid
+    assert any(d.code == "radar_signature.invalid_constant" for d in result.diagnostics)
+
+
+def test_project_rejects_missing_weapon_effects_definition() -> None:
+    files = emit_project(_minimal_scenario())
+    files["weapons/WSF_IMPLICIT_WEAPON.txt"] = ""
+    result = lint_project(files)
+    assert any(d.code == "weapon_effects.undefined" for d in result.diagnostics)
+
+
+def test_project_rejects_undefined_wsf_prefixed_custom_type() -> None:
+    files = emit_project(_minimal_scenario())
+    files["main.txt"] = files["main.txt"].replace(" J20_AIR", " WSF_PLATFORM_MISSING")
+    assert any(d.code == "platform.unknown_type" for d in lint_project(files).diagnostics)
+
+
+def test_invalid_project_does_not_overwrite_existing_files(tmp_path: Path) -> None:
+    root = tmp_path / "scenario"
+    root.mkdir()
+    original = root / "main.txt"
+    original.write_text("original", encoding="utf-8")
+    files = emit_project(_minimal_scenario())
+    files["platforms/J20_AIR.txt"] = "platform_type J20_AIR\n"
+    with pytest.raises(CompileError):
+        write_project(_minimal_scenario(), root, files=files)
+    assert original.read_text(encoding="utf-8") == "original"
+    assert list(root.iterdir()) == [original]
+
+
+def test_project_write_stays_in_selected_directory(tmp_path: Path) -> None:
+    original = tmp_path / "air_8v8"
+    original.mkdir()
+    marker = original / "main.txt"
+    marker.write_text("original", encoding="utf-8")
+    write_project(_minimal_scenario(), tmp_path / "air_8v8_qoder")
+    assert marker.read_text(encoding="utf-8") == "original"
+    assert list(original.iterdir()) == [marker]
+
+
+def test_project_rejects_symlink_escape_before_writing(tmp_path: Path) -> None:
+    root = tmp_path / "scenario"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "platforms").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(CompileError, match="越界"):
+        write_project(_minimal_scenario(), root)
+    assert list(outside.iterdir()) == []
+    assert not (root / "main.txt").exists()
+
+
+@pytest.mark.parametrize("path", ["../outside.txt", "/tmp/outside.txt", "C:/outside.txt"])
+def test_project_rejects_output_path_traversal(path: str) -> None:
+    files = emit_project(_minimal_scenario())
+    files[path] = ""
+    assert any(d.code == "project.invalid_path" for d in lint_project(files).diagnostics)
+
+
+def test_type_key_collision_is_rejected() -> None:
+    scenario = _multi_platform_scenario()
+    scenario.platforms[1].platform_type = "H6K_AIR"
+    scenario.platforms[1].mover_type = None
+    scenario.platforms[1].route = []
+    with pytest.raises(CompileError, match="collision"):
+        AfsimCompiler().compile(scenario)
+    with pytest.raises(CompileError, match="collision"):
+        emit_project(scenario)
+
+
+def test_disabled_sensor_is_explicitly_off_in_both_outputs() -> None:
+    scenario = _minimal_scenario()
+    scenario.platforms[0].sensors[0].enabled = False
+    assert "      off" in AfsimCompiler().compile(scenario)
+    assert "      off" in emit_project(scenario)["main.txt"]
+
+
+def test_air8v8_has_complete_types_routes_and_original_fire_times() -> None:
+    scenario = _minimal_scenario()
+    prototype = scenario.platforms[0]
+    intent = scenario.mission.platforms[0]
+    platforms = []
+    intents = []
+    engagements = []
+    for side, fire_time in ((Side.BLUE, 300), (Side.RED, 330)):
+        enemy = "red" if side == Side.BLUE else "blue"
+        for group in (1, 2):
+            for slot in (1, 2, 3, 4):
+                name = f"{side.value}_j16_{group}_{slot}"
+                platform = prototype.model_copy(deep=True, update={
+                    "platform_id": name, "side": side,
+                    "platform_type": "J16" if side == Side.BLUE else "WSF_PLATFORM",
+                })
+                platform.weapons[0].instance_name = "mrm"
+                platform.weapons[0].quantity = 4
+                platforms.append(platform)
+                intents.append(intent.model_copy(deep=True, update={"platform_id": name, "side": side}))
+                engagements.append(ScheduledEngagementIR(
+                    engagement_id=f"fire_{name}", shooter_platform=name,
+                    target_platform=f"{enemy}_j16_{group}_{slot}",
+                    weapon_name="mrm", fire_time_s=fire_time,
+                ))
+    scenario.platforms = platforms
+    scenario.mission.platforms = intents
+    scenario.engagements = engagements
+    scenario = ScenarioIR.model_validate(scenario.model_dump())
+    files = emit_project(scenario)
+    single = AfsimCompiler().compile(scenario)
+    assert lint_project(files).is_valid
+    assert lint_afsim(single).is_valid
+    for text in (files["main.txt"], single):
+        assert sum(line.startswith("platform ") for line in text.splitlines()) == 16
+        assert text.count("   route\n") == text.count("   end_route") == 16
+        assert text.count("execute at_time 300 sec absolute") == 8
+        assert text.count("execute at_time 330 sec absolute") == 8
+        assert text.count("quantity 4") == 16
+    assert set(path for path in files if path.startswith("platforms/")) == {
+        "platforms/J16_AIR.txt", "platforms/WSF_PLATFORM_AIR.txt",
+    }
+    for name in ("J16_AIR", "WSF_PLATFORM_AIR"):
+        assert f"platform_type {name} WSF_PLATFORM" in single
+        assert files[f"platforms/{name}.txt"].count("end_platform_type") == 1
+        assert files[f"platforms/{name}.txt"].count("end_mover") == 1
+
+
+@pytest.mark.parametrize("end", ["end_weapon", "end_weapon_effects", "end_execute"])
+def test_linter_detects_missing_weapon_and_script_closures(end: str) -> None:
+    scenario = _multi_platform_scenario()
+    scenario.engagements = [ScheduledEngagementIR(
+        engagement_id="fire_1", shooter_platform="blue_h6k_1", target_platform="blue_h6k_2",
+        weapon_name="missile", fire_time_s=300,
+    )]
+    text = AfsimCompiler().compile(scenario)
+    assert lint_afsim(text).is_valid
+    result = lint_afsim(text.replace(end, "", 1))
+    assert not result.is_valid
+
+
+def test_shared_effect_is_defined_once_for_different_weapon_types() -> None:
+    scenario = _multi_platform_scenario()
+    scenario.platforms[1].weapons[0].weapon_type = "WSF_EXPLICIT_WEAPON"
+    files = emit_project(scenario)
+    text, _, errors = expand_project(files)
+    assert not errors
+    assert text.count("weapon_effects AUTO_ENGAGEMENT_EFFECT WSF_SPHERICAL_LETHALITY") == 1
+    assert lint_project(files).is_valid
+
+
+def test_fire_script_skips_target_already_removed_from_simulation() -> None:
+    # 即时毁伤会删除目标; 两个射手攻击同一目标时, 后一发不能对空引用 MakeTrack。
+    scenario = _multi_platform_scenario()
+    scenario.engagements = [
+        ScheduledEngagementIR(
+            engagement_id=f"fire_{shooter}", shooter_platform=shooter,
+            target_platform="blue_h6k_2", weapon_name="missile", fire_time_s=fire_time,
+        )
+        for shooter, fire_time in (("blue_h6k_1", 300), ("blue_h6k_3", 330))
+    ]
+    files = emit_project(scenario)
+    single = AfsimCompiler().compile(scenario)
+    assert lint_project(files).is_valid
+    assert lint_afsim(single).is_valid
+    guarded = (
+        '      WsfPlatform target_plat = WsfSimulation.FindPlatform("blue_h6k_2");\n'
+        "      if (target_plat.IsValid())\n"
+        "      {\n"
+        '         Weapon("missile").Fire(target_plat.MakeTrack());\n'
+        "      }\n"
+        "   end_execute"
+    )
+    for text in (files["main.txt"], single):
+        assert "FindPlatform(\"blue_h6k_2\").MakeTrack()" not in text
+        assert text.count(guarded) == 2

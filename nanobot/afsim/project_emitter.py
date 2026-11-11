@@ -48,7 +48,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .compiler import _number, _position, _route_position
+from .compiler import (
+    CompileError,
+    _fire_script,
+    _number,
+    _platform_type_key,
+    _platform_types,
+    _position,
+    _route_position,
+)
+from .linter import lint_project
 from .schemas import (
     PlatformIR,
     ScenarioIR,
@@ -107,17 +116,6 @@ def _render_weapon_effects_type(weapon_type: str) -> str:
     )
 
 
-def _mover_suffix(mover_type: str) -> str:
-    """把 mover 类型名转成短后缀, 用于生成类型文件名。
-
-    同一基型 (如 WSF_PLATFORM) 按 mover 分家时, 后缀让文件名能区分:
-    WSF_PLATFORM + WSF_AIR_MOVER     -> WSF_PLATFORM_AIR
-    WSF_PLATFORM + WSF_SURFACE_MOVER -> WSF_PLATFORM_SURFACE
-    WSF_PLATFORM (无 mover)          -> WSF_PLATFORM
-    """
-    return mover_type.removeprefix("WSF_").removesuffix("_MOVER")
-
-
 def _render_platform_type(
     type_key: str,
     base_type: str,
@@ -127,27 +125,19 @@ def _render_platform_type(
 
     只写类型层面的属性 (mover、雷达签名), 不写实例层面的 (位置、航路、传感器挂载)。
 
-    ``type_key`` 是文件/类型名 (如 ``H6K_AIR``), ``base_type`` 是 AFSIM 里的
-    ``platform_type`` 声明名 (如 ``H6K``)。两者可以不同: 同一个 ``H6K`` 基型,
-    按 mover 分家成 ``H6K_AIR`` / ``H6K_SURFACE`` 等多个文件, 避免"所有平台共享
-    首个平台的 mover"这种错误。
+    ``type_key`` 是文件/类型名 (如 ``H6K_AIR``)，``base_type`` 是 IR 的型号标签。
+    本后端不加载外部型号库，生成类型统一继承内置 ``WSF_PLATFORM``。
+    同一型号按 mover 分家，固定的 WSF_* 标签加 STATIC 后缀，避免覆盖内置类型。
     """
     lines = [
         _header(f"platform type {type_key} (base {base_type})"),
-        f"platform_type {type_key}",
+        f"platform_type {type_key} WSF_PLATFORM",
     ]
     if mover_type:
-        # mover 在 platform_type 里是单行引用 (与官方 demo 一致), 不是带 end_mover 的块。
-        # 验证器的 end_* 配额法处理不了嵌套: 内层 end_mover 会被误判成闭合外层
-        # platform_type, 触发 block.mismatch。
-        lines.append(f"   mover {mover_type}")
-    # 共享雷达签名: 官方 demo 把 signature 放在类型定义里, 所有实例继承。
-    # 这里简化为"所有平台共用一个 10dB_FuzzBall"。
-    lines += [
-        "   radar_signature 10dB_FuzzBall",
-        "      constant 10 dBsm",
-        "   end_radar_signature",
-    ]
+        # mover 是嵌套块，不能省略结束符。
+        lines += [f"   mover {mover_type}", "   end_mover"]
+    # 签名在 _common.txt 顶层定义；类型内只引用。
+    lines += ["   radar_signature 10dB_FuzzBall", "end_platform_type"]
     lines.append("")
     return "\n".join(lines)
 
@@ -164,11 +154,7 @@ def _render_platform_instance(
     实例引用的类型名必须与 ``emit_project()`` 里生成的 ``type_key`` 一致
     (按 mover 分家: ``H6K_AIR`` / ``H6K_SURFACE`` / ``H6K``)。
     """
-    type_key = (
-        platform.platform_type
-        if platform.mover_type is None
-        else f"{platform.platform_type}_{_mover_suffix(platform.mover_type)}"
-    )
+    type_key = _platform_type_key(platform)
     lines = [
         f"platform {platform.platform_id} {type_key}",
         f"   side {platform.side.value}",
@@ -199,19 +185,20 @@ def _render_platform_instance(
     # 交战脚本: 这个平台作为 shooter 的所有 engagement
     for engagement in scenario.engagements:
         if engagement.shooter_platform == platform.platform_id:
-            lines += [
-                f"   execute at_time {_number(engagement.fire_time_s)} sec absolute",
-                f'      Weapon("{engagement.weapon_name}").Fire('
-                f'WsfSimulation.FindPlatform("{engagement.target_platform}").MakeTrack());',
-                "   end_execute",
-            ]
+            lines.append(_fire_script(engagement))
     lines += ["end_platform", ""]
     return "\n".join(lines)
 
 
 def _render_common(includes: list[str]) -> str:
     """_common.txt: 聚合所有类型文件的 include_once。"""
-    lines = [_header("common type definitions")]
+    lines = [
+        _header("common type definitions"),
+        "radar_signature 10dB_FuzzBall WSF_RADAR_SIGNATURE",
+        "   constant 10 dBsm",
+        "end_radar_signature",
+        "",
+    ]
     for inc in includes:
         lines.append(f"include_once {inc}")
     lines.append("")
@@ -222,14 +209,14 @@ def _render_event_output() -> str:
     return (
         _header("event output configuration")
         + "event_output\n"
-        + "   file events.evt\n"
+        + "   file output/events.evt\n"
         + "   enable SENSOR_DETECTION_ATTEMPT\n"
         + "   enable SENSOR_TRACK_INITIATED\n"
         + "   enable WEAPON_FIRED\n"
         + "end_event_output\n"
         + "\n"
         + "event_pipe\n"
-        + "   file replay.aer\n"
+        + "   file output/replay.aer\n"
         + "end_event_pipe\n"
     )
 
@@ -290,21 +277,12 @@ def emit_project(scenario: ScenarioIR) -> dict[str, str]:
     for platform in scenario.platforms:
         for weapon in platform.weapons:
             weapon_types.add(weapon.weapon_type)
-    for weapon_type in sorted(weapon_types):
+    # 所有武器共享同一效应名，只定义一次，避免不同武器类型重复定义。
+    effect_types = sorted(weapon_types)[:1]
+    for weapon_type in effect_types:
         files[f"weapons/{weapon_type}.txt"] = _render_weapon_effects_type(weapon_type)
 
-    platform_types: dict[str, tuple[str, str | None]] = {}
-    for platform in scenario.platforms:
-        # 按 (platform_type, mover_type) 分家: 同一基型不同 mover 得拆成多个文件,
-        # 否则所有平台会共享首个平台的 mover (4 架轰-6K 的 WSF_AIR_MOVER 会污染
-        # 红方巡洋舰和岸基雷达)。
-        mover = platform.mover_type
-        type_key = (
-            platform.platform_type
-            if mover is None
-            else f"{platform.platform_type}_{_mover_suffix(mover)}"
-        )
-        platform_types.setdefault(type_key, (platform.platform_type, mover))
+    platform_types = _platform_types(scenario)
     for type_key, (base_type, mover_type) in platform_types.items():
         files[f"platforms/{type_key}.txt"] = _render_platform_type(
             type_key, base_type, mover_type
@@ -315,7 +293,7 @@ def emit_project(scenario: ScenarioIR) -> dict[str, str]:
 
     # 3. _common.txt: 聚合所有类型 include
     common_includes = [f"sensors/{t}.txt" for t in sorted(sensor_types)]
-    common_includes += [f"weapons/{t}.txt" for t in sorted(weapon_types)]
+    common_includes += [f"weapons/{t}.txt" for t in effect_types]
     common_includes += [f"platforms/{t}.txt" for t in sorted(platform_types)]
     files["_common.txt"] = _render_common(common_includes)
 
@@ -328,15 +306,29 @@ def emit_project(scenario: ScenarioIR) -> dict[str, str]:
     return files
 
 
-def write_project(scenario: ScenarioIR, root: Path) -> dict[str, Path]:
+def write_project(
+    scenario: ScenarioIR, root: Path, *, files: dict[str, str] | None = None
+) -> dict[str, Path]:
     """把 emit_project() 的结果写到磁盘, 返回 {相对路径: 绝对路径}。
 
     `root` 不存在会创建; 已存在会**覆盖**同名文件 (这是预期: 重新生成想定就该覆盖)。
     """
-    root = Path(root)
+    files = emit_project(scenario) if files is None else files
+    result = lint_project(files)
+    if not result.is_valid:
+        errors = [
+            f"{d.file}:{d.line} {d.code}: {d.message}"
+            for d in result.diagnostics if d.severity.value == "error"
+        ]
+        raise CompileError("最终项目静态检查失败: " + "; ".join(errors))
+    root = Path(root).resolve()
+    # 路径白名单之外还拒绝现有符号链接指向项目目录外，防止越界写盘。
+    for rel_path in files:
+        if not (root / rel_path).resolve().is_relative_to(root):
+            raise CompileError(f"项目路径越界: {rel_path}")
     root.mkdir(parents=True, exist_ok=True)
     written: dict[str, Path] = {}
-    for rel_path, content in emit_project(scenario).items():
+    for rel_path, content in files.items():
         full = root / rel_path
         full.parent.mkdir(parents=True, exist_ok=True)
         full.write_text(content, encoding="utf-8")

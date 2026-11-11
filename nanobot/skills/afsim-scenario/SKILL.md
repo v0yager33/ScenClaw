@@ -46,14 +46,15 @@ AFSIM 文本 ──► 确定性 Jinja2 渲染（同一 IR 必得同一输出，
 
 - `nl_to_afsim` — 端到端。参数：`request`（必填，自然语言）、`output_path`、
   `center_lat` / `center_lon`（战区中心，默认 27.5 / 122.5）、`duration_s`、
-  `scenario_id`、`max_repair_rounds`（默认 3）。
+  `scenario_id`、`max_repair_rounds`（默认 3，含需求核对轮）、`audit_requirements`（默认 true）、
+  `check_requirements`（默认 true，把需求里的数值约束抽成条款由代码核验，抽取调用不计轮数）。
 - `nl_scenario_plan` — 只产出 ScenarioIR，不落地 AFSIM，便于人工审阅 IR。
 - `scenario_compile` — ScenarioIR → AFSIM 文本，纯确定性，可反复重放。
 
 API key 走 `DEEPSEEK_API_KEY` 环境变量，别写进工具参数（会进 trace 和反思记忆）。
 `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` 可切换到任意 OpenAI 兼容服务。
 
-### 输出里必须看的五处
+### 输出里必须看的七处
 
 | 字段 | 含义 |
 | --- | --- |
@@ -61,7 +62,9 @@ API key 走 `DEEPSEEK_API_KEY` 环境变量，别写进工具参数（会进 tra
 | `capability_gaps` | **需求里表达不了的能力**，代码扫需求文本得出，不依赖模型自述 |
 | `unverified_capabilities` | 用到了放行但未经 `mission.exe` 实跑验证的 AFSIM 类型 |
 | `normalizations` | 代码对 IR 做的确定性修正（如删掉无航路的 mover） |
-| `trace` | 每轮 extract / repair / refine 修了什么 |
+| `requirements_audit` | 需求核对轮结果：`met` 为模型对照代码推算的事实表确认需求数值都已满足，`unconfirmed` 为核对过但最终版没得到确认，空串为未进行 |
+| `requirement_checks` / `requirement_notes` | 从需求原文抽出、由代码逐版核验的数值条款；notes 记录被丢弃的条款和抽取失败原因，空列表表示没抽到或未开启 |
+| `trace` | 每轮 extract / repair / refine / audit 修了什么 |
 
 `capability_gaps` 非空不代表失败，代表**部分建模 + 缺口已声明**。这是刻意的：
 表达不了就如实说，绝不用相近字段假装实现。实测中模型会把几何传感器改名叫

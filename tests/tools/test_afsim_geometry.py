@@ -19,9 +19,11 @@ from nanobot.afsim import (
     check_geometry,
     ground_distance_m,
     min_separation_m,
+    position_at,
     route_duration_s,
     route_length_m,
     slant_range_m,
+    waypoint_times_s,
 )
 
 
@@ -198,6 +200,87 @@ def test_static_platform_has_zero_route_duration() -> None:
     assert route_duration_s(scenario.platforms[0]) == 0.0
 
 
+# ── 按时刻推算位置 ─────────────────────────────────────────────────
+
+
+def test_position_at_static_platform_is_initial_position() -> None:
+    scenario = _scenario([_platform("static1", 27.0, 122.0)])
+    point = position_at(scenario.platforms[0], 900.0)
+    assert point == scenario.platforms[0].position
+
+
+def test_position_at_interpolates_along_legs() -> None:
+    scenario = _scenario(
+        [
+            _platform(
+                "mover1", 27.0, 122.0, 8000.0,
+                mover="WSF_AIR_MOVER",
+                route=[
+                    _waypoint(28.0, 122.0, 8000.0, 250.0),
+                    _waypoint(28.0, 123.0, 8000.0, 100.0),
+                ],
+            )
+        ]
+    )
+    platform = scenario.platforms[0]
+    first_leg_s = 111_195 / 250
+    assert position_at(platform, first_leg_s / 2).latitude_deg == pytest.approx(27.5, abs=0.01)
+    # 第二段按第二段的速度走: 再过 300s 约东移 30 km
+    later = position_at(platform, first_leg_s + 300.0)
+    assert later.latitude_deg == pytest.approx(28.0)
+    assert ground_distance_m(_point(28.0, 122.0), later) == pytest.approx(30_000, rel=0.02)
+
+
+def test_position_at_unknown_after_route_end() -> None:
+    """航路走完之后怎么飞不由 IR 决定, 不能拿终点冒充。"""
+    scenario = _scenario(
+        [
+            _platform(
+                "mover1", 27.0, 122.0, 8000.0,
+                mover="WSF_AIR_MOVER",
+                route=[_waypoint(28.0, 122.0, 8000.0, 250.0)],
+            )
+        ]
+    )
+    assert position_at(scenario.platforms[0], 1000.0) is None
+
+
+def test_waypoint_times_accumulate_leg_by_leg() -> None:
+    """第二段没写速度就沿用第一段, 与 position_at 的推算口径一致。"""
+    scenario = _scenario(
+        [
+            _platform(
+                "mover1", 27.0, 122.0, 8000.0,
+                mover="WSF_AIR_MOVER",
+                route=[
+                    _waypoint(28.0, 122.0, 8000.0, 250.0),
+                    _waypoint(29.0, 122.0, 8000.0),
+                ],
+            )
+        ]
+    )
+    times = waypoint_times_s(scenario.platforms[0])
+    assert times == pytest.approx([111_195 / 250, 2 * 111_195 / 250], rel=0.02)
+
+
+def test_waypoint_times_none_when_first_leg_lacks_speed() -> None:
+    scenario = _scenario(
+        [
+            _platform(
+                "mover1", 27.0, 122.0, 8000.0,
+                mover="WSF_AIR_MOVER",
+                route=[_waypoint(28.0, 122.0, 8000.0)],
+            )
+        ]
+    )
+    assert waypoint_times_s(scenario.platforms[0]) is None
+
+
+def test_waypoint_times_empty_for_static_platform() -> None:
+    scenario = _scenario([_platform("static1", 27.0, 122.0)])
+    assert waypoint_times_s(scenario.platforms[0]) == []
+
+
 # ── 最近距离 ────────────────────────────────────────────────────────
 
 
@@ -362,8 +445,12 @@ def test_route_exceeding_duration_is_reported() -> None:
         ],
         duration_s=600.0,   # 10 分钟走 445 km 显然不够
     )
-    kinds = {f.kind for f in check_geometry(scenario)}
-    assert "route_exceeds_duration" in kinds
+    findings = check_geometry(scenario)
+    assert "route_exceeds_duration" in {f.kind for f in findings}
+    # 修法所需的数字直接算好: 模型在思考里逐条重算航程, 实测会耗尽输出预算
+    message = next(f.message for f in findings if f.kind == "route_exceeds_duration")
+    assert "只飞完前 0/1 个航点" in message
+    assert "平均速度至少要 741 m/s" in message
 
 
 def test_route_within_duration_is_not_reported() -> None:
@@ -447,6 +534,68 @@ def test_engagement_with_detection_is_not_reported() -> None:
     )
     kinds = {f.kind for f in check_geometry(scenario)}
     assert "engagement_without_detection" not in kinds
+
+
+def _inbound_strike(fire_time_s: float) -> ScenarioIR:
+    """红方从 300 km 外飞向蓝方射手: 全程进得了探测圈, 早开火时还在圈外。"""
+    return _scenario(
+        [
+            _platform(
+                "shooter", 27.5, 122.0, 8000.0,
+                sensors=_RADAR_MOUNT,
+                weapons=[{"instance_name": "aam"}],
+            ),
+            _platform(
+                "intruder", 27.5, 125.0, 8000.0, side="red",
+                mover="WSF_AIR_MOVER",
+                route=[_waypoint(27.5, 122.5, 8000.0, 250.0)],
+            ),
+        ],
+        sensors=_RADAR,
+        engagements=[
+            {
+                "engagement_id": "strike",
+                "shooter_platform": "shooter",
+                "target_platform": "intruder",
+                "weapon_name": "aam",
+                "fire_time_s": fire_time_s,
+            }
+        ],
+    )
+
+
+def test_engagement_fired_before_detection_is_reported() -> None:
+    """全程够得着, 但开火时目标还在 280 km 外: 这一发打向看不见的目标。"""
+    findings = check_geometry(_inbound_strike(60.0))
+    kinds = {f.kind for f in findings}
+    assert "engagement_without_detection" not in kinds
+    assert "engagement_out_of_detection_at_fire_time" in kinds
+    message = next(f.message for f in findings if f.kind == "engagement_out_of_detection_at_fire_time")
+    assert "60s" in message and "150 km" in message
+    # 可探测时段由代码算好, 模型不必按航速自己推算交会时刻
+    assert "能探测到它的时段是 590-980s" in message
+
+
+def test_engagement_never_detectable_says_so() -> None:
+    """航路飞完前都进不了探测圈: 提示改航路, 而不是给一个不存在的时段。"""
+    scenario = _inbound_strike(60.0)
+    scenario.mission.duration_s = 400.0
+    message = next(
+        f.message for f in check_geometry(scenario)
+        if f.kind == "engagement_out_of_detection_at_fire_time"
+    )
+    assert "任务时长内我方都探测不到它" in message
+
+
+def test_engagement_fired_inside_detection_is_not_reported() -> None:
+    kinds = {f.kind for f in check_geometry(_inbound_strike(900.0))}
+    assert "engagement_out_of_detection_at_fire_time" not in kinds
+
+
+def test_engagement_after_route_end_is_not_judged() -> None:
+    """开火时目标已飞完航路, 位置推算不出来, 宁可不报。"""
+    kinds = {f.kind for f in check_geometry(_inbound_strike(3000.0))}
+    assert "engagement_out_of_detection_at_fire_time" not in kinds
 
 
 def test_space_domain_platform_is_skipped() -> None:
