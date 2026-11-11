@@ -8,6 +8,7 @@
 这里把这类条款收成几种固定类型: 模型只负责从需求原文里抽出条款 (不做计算), 核验全部
 由代码按 IR 匀速推算完成。不满足的条款作为问题回灌修订轮, 消息里直接带上修法所需的数字。
 推算口径与 ``geometry`` 一致: 忽略转弯和加减速, 航路飞完之后的位置不计。
+例外是交战包络: 开火时刻晚于某一方航路终点时斜距无从保证, 按不满足报。
 """
 
 from __future__ import annotations
@@ -32,15 +33,20 @@ REQUIREMENT_CHECKS_SPEC = """条款类型与字段 (单位: km、s、m、m/s、�
 - formation_spacing {groups, min_km, max_km}: 编队内每架与同队最近一架的初始地面距离; groups 每项是一个编队 (选择器或选择器列表), 不给时按阵营分组
 - fire_window {shooters, start_s, end_s}: 这些射手的每一次开火都必须落在该时段内
 - fire_phases {windows, min_count, shooters}: windows 写 [[起, 止], ...], 要求至少 min_count 个时段内有开火; shooters 可省略 (表示全部射手)
-- engagement_range {shooters, min_km, max_km}: 每次开火时射手与目标的斜距; shooters 可省略
+- engagement_range {shooters, min_km, max_km}: 每次开火时射手与目标的斜距; shooters 可省略; 交战包络、射程、毁伤半径是距离上限, 只写 max_km
 - reach_area {platforms, lat_min, lat_max, lon_min, lon_max, start_s, end_s, alive}: 每个平台首次进入该经纬度区域的时刻须在时段内; 区域边界和时段都可只给一侧; alive 默认 true, 表示进入时必须仍存活
 - altitude_range {platforms, min_m, max_m}: 初始位置和全部航点的高度
 - speed_range {platforms, min_mps, max_mps}: 全部航点的速度
-有上下限的字段至少给一个; 每条可加 quote, 摘一句对应的需求原文 (40 字以内)。"""
+- route_points {platforms, min_count}: 每个平台的航点 (route) 至少 min_count 个
+有上下限的字段至少给一个; 原文写"约 X"时边界就取 X, 不要自行放宽成区间或补上原文没有的另一侧; 每条可加 quote, 摘一句对应的需求原文 (40 字以内)。"""
 
 _QUOTE_LIMIT = 40
 _RANGE_STEP_S = 5.0
+# 进区时刻的建议目标离时段边界的距离 (秒); 时段较短时取四分之一宽度
+_ENTRY_MARGIN_S = 60.0
 _MAX_SPANS = 3
+# 实测: 开火时刻贴着包络时段的端点, 下一轮改航路后斜距变成 101 km, 修订轮数用完没修回来
+_FIRE_MARGIN_S = 15.0
 
 # 字段类型: num 数值, count 正整数, bool, selectors 选择器列表, groups 编队列表, windows 时段列表
 _FIELDS: dict[str, dict[str, str]] = {
@@ -56,6 +62,7 @@ _FIELDS: dict[str, dict[str, str]] = {
     },
     "altitude_range": {"platforms": "selectors", "min_m": "num", "max_m": "num"},
     "speed_range": {"platforms": "selectors", "min_mps": "num", "max_mps": "num"},
+    "route_points": {"platforms": "selectors", "min_count": "count"},
 }
 _REQUIRED: dict[str, tuple[str, ...]] = {
     "fire_window": ("shooters",),
@@ -63,6 +70,7 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
     "reach_area": ("platforms",),
     "altitude_range": ("platforms",),
     "speed_range": ("platforms",),
+    "route_points": ("platforms", "min_count"),
 }
 _ANY_OF: dict[str, tuple[str, ...]] = {
     "side_separation": ("min_km", "max_km"),
@@ -422,8 +430,17 @@ def _engagement_range(scenario, params, platforms, destroyed) -> list[str]:
             continue
         moment = engagement.fire_time_s
         km = _slant_km(shooter, target, moment)
-        if km is None or _within(km, low, high):
-            continue  # 航路飞完之后的位置推算不出, 不下结论
+        if km is not None and _within(km, low, high):
+            continue
+        # 实测: 红方航路 624 s 就飞完, 1300 s 的射击推算不出斜距被跳过, 外部按终点
+        # 位置量出 136 km。航路之后怎么飞不由 IR 决定, 这种射击的包络同样没有保证
+        ended = [
+            (platform.platform_id, end)
+            for platform in (shooter, target)
+            if (end := _route_end_s(platform)) is not None and end < moment
+        ]
+        if km is None and not ended:
+            continue  # 航段缺速度, 由航路检查负责报
         # 按计划打不出的射击照样核验: 前面的击毁一旦没生效, 它会在包络外开火。
         # 实测: 先手方把对方射手提前打掉, 对方那几发计划仍停在 100 km 外
         voided = _voided_by(engagement, destroyed)
@@ -435,7 +452,10 @@ def _engagement_range(scenario, params, platforms, destroyed) -> list[str]:
                     horizon = min(horizon, killed[0])
         spans = _spans(lambda t: _within_or_none(_slant_km(shooter, target, t), low, high), horizon)
         if spans:
-            advice = f"按当前航路两者相距在包络内的时段是 {_join_spans(spans)}; 请把开火时刻调进这些时段, 或调整航路"
+            advice = (
+                f"按当前航路两者相距在包络内的时段是 {_join_spans(spans)}; 请把开火时刻调进这些时段"
+                f" (离端点留 {_FIRE_MARGIN_S:g}s 以上余量, 之后改航路时不至于又滑出包络), 或调整航路"
+            )
         else:
             advice = f"按当前航路, {horizon:g}s 之前两者都不在包络内; 请调整航路或改打别的目标"
         if voided is not None:
@@ -449,6 +469,14 @@ def _engagement_range(scenario, params, platforms, destroyed) -> list[str]:
                     else ""
                 )
             )
+        if km is None:
+            finished = "、".join(f"{pid} 的航路 {end:.0f}s 飞完" for pid, end in ended)
+            messages.append(
+                f"交战 {engagement.engagement_id} 在 {moment:g}s 开火时航路已经飞完 ({finished}),"
+                f" 之后的位置不由 IR 决定, 斜距不能保证在 {_span(low, high, 'km')} 内;"
+                f" 请续上航点让航路覆盖到开火时刻。{advice}"
+            )
+            continue
         messages.append(
             f"交战 {engagement.engagement_id} 在 {moment:g}s 开火时 {shooter.platform_id} 与 "
             f"{target.platform_id} 斜距约 {km:.0f} km, 不在要求的 {_span(low, high, 'km')} 内。{advice}"
@@ -480,7 +508,7 @@ def _reach_area(scenario, params, platforms, destroyed) -> list[str]:
                 f" 请推迟或改掉这次射击, 或让它更早进区"
             )
         if not _within(entered_at, start, end):
-            problems.append(_entry_timing_advice(platform, travelled_m, start, end))
+            problems.append(_entry_timing_advice(platform, travelled_m, entered_at, start, end))
         if problems:
             messages.append(
                 f"{pid} 在约 {entered_at:.0f}s 首次进入要求区域 ({area}), 要求 {_span(start, end, 's')}: "
@@ -518,6 +546,23 @@ def _speed_range(_scenario, params, platforms, _destroyed) -> list[str]:
     return messages
 
 
+def _route_points(scenario, params, platforms, _destroyed) -> list[str]:
+    need = params["min_count"]
+    duration = scenario.mission.duration_s
+    messages = []
+    for platform in platforms:
+        count = len(platform.route)
+        if count >= need:
+            continue
+        times = waypoint_times_s(platform) if platform.route else None
+        budget = f"; 当前航路预计 {times[-1]:.0f}s 飞完 (任务 {duration:g}s)" if times else ""
+        messages.append(
+            f"{platform.platform_id} 只有 {count} 个航点, 要求至少 {need} 个{budget};"
+            f" 请拆分长航段或加折线航点, 保持航路在任务时长内飞完"
+        )
+    return messages
+
+
 _EVALUATORS = {
     "side_separation": _side_separation,
     "formation_spacing": _formation_spacing,
@@ -527,6 +572,7 @@ _EVALUATORS = {
     "reach_area": _reach_area,
     "altitude_range": _altitude_range,
     "speed_range": _speed_range,
+    "route_points": _route_points,
 }
 
 
@@ -554,6 +600,12 @@ def _voided_by(
     ):
         return engagement.target_platform, *target
     return None
+
+
+def _route_end_s(platform: PlatformIR) -> float | None:
+    """航路飞完的时刻; 静止平台或航段缺速度时返回 None。"""
+    times = waypoint_times_s(platform) if platform.route else None
+    return times[-1] if times else None
 
 
 def _slant_km(first: PlatformIR, second: PlatformIR, moment: float) -> float | None:
@@ -640,7 +692,11 @@ def _extent(points: list[GeoPoint]) -> str:
 
 
 def _entry_timing_advice(
-    platform: PlatformIR, travelled_m: float, start: float | None, end: float | None
+    platform: PlatformIR,
+    travelled_m: float,
+    entered_at: float,
+    start: float | None,
+    end: float | None,
 ) -> str:
     times = waypoint_times_s(platform) or []
     schedule = "/".join(f"{t:.0f}" for t in times)
@@ -656,6 +712,33 @@ def _entry_timing_advice(
     return (
         f"进区前航程约 {km:.0f} km (航点预计到达 {schedule}s), 要在要求时段进区, 这段的平均速度"
         f"需在 {speed}; 速度受限时改航程 (增删或挪动进区前的航点)"
+        + _entry_target(travelled_m, entered_at, start, end)
+    )
+
+
+def _entry_target(
+    travelled_m: float, entered_at: float, start: float | None, end: float | None
+) -> str:
+    """按当前平均速度给出离边界留有余量的进区时刻和对应航程。
+
+    实测: 只给速度区间时模型把进区时刻改到 897-898 s, 要求 900-1200 s, 连续两轮差两三秒;
+    速度又被需求限死在 220 m/s 以上, 只能改航程, 却不知道改多少。
+    """
+    if entered_at <= 0:
+        return ""
+    margin = _ENTRY_MARGIN_S
+    if start is not None and end is not None:
+        margin = min(margin, (end - start) / 4)
+    if start is not None and entered_at < start:
+        target = start + margin
+    elif end is not None and entered_at > end:
+        target = end - margin
+    else:
+        return ""
+    speed = travelled_m / entered_at
+    return (
+        f"; 按当前进区前平均速度约 {speed:.0f} m/s, 进区前航程改到约 {speed * target / 1000:.0f} km"
+        f" 可在 {target:.0f}s 左右进区, 离时段边界留出余量"
     )
 
 

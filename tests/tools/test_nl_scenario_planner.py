@@ -1414,8 +1414,22 @@ def test_missing_closers_are_added_only_when_safe() -> None:
         '{"a": {"b": [1',                 # 不以闭合符结尾
         '{"a": {"b": {"c": {"d": 1}',     # 缺得太多
         '{"a": [1}}',                     # 闭合符配不上
+        '{"a": {"b": {"c": [1}',          # 中途补一个、结尾还缺两个, 超过上限
     ):
         assert _parse_json_object(text, close_unbalanced=True)[0] is None, text
+
+
+def test_closers_missing_mid_stream_are_added_before_the_mismatch() -> None:
+    """rerun 实测: 列表中途漏了 "]" 就写了外层的 "}", 修复轮模型删掉别处的 "}" 凑配对。"""
+    text = '{"a": {"b": ["x", "y"}, "c": 1}'
+    assert _parse_json_object(text, close_unbalanced=True) == ({"a": {"b": ["x", "y"]}, "c": 1}, [])
+    assert _parse_json_object(text)[0] is None  # 默认不补
+
+    ir = _dumps(_valid_ir())
+    cut = ir.index("]}")
+    llm = FinishReasonLLM([(ir[:cut] + ir[cut + 1:], "stop")])
+    result = ScenarioIRPlanner(llm=llm).plan("任务")
+    assert result.success and result.attempts[0].ok
 
 
 def test_finished_patch_missing_its_last_brace_is_merged() -> None:

@@ -60,7 +60,7 @@ def _shot(engagement_id: str, shooter: str, target: str, time_s: float) -> dict[
 def _scenario(engagements: list[dict[str, Any]] | None = None) -> ScenarioIR:
     """两队各两架, 蓝方向东、红方向西相向飞行; 初始双方相距约 200 km, 同队间隔约 5.6 km。
 
-    蓝机 250 m/s 飞 1 个经度 (约 99 km, 约 394 s 飞完), 红机飞 0.8 个经度 (约 316 s 飞完)。
+    蓝机 250 m/s 飞 1 个经度 (约 99 km, 约 396 s 飞完), 红机飞 0.8 个经度 (约 317 s 飞完)。
     """
     platforms = [
         _plane("blue_1", "blue", 27.0, 121.0, route=[(27.0, 122.0)]),
@@ -138,6 +138,7 @@ def test_parse_without_a_checks_list_is_noted() -> None:
     ({"kind": "fire_phases", "windows": [[300, 0]], "min_count": 1}, "取值不合法"),
     ({"kind": "fire_phases", "windows": [[0, 300]], "min_count": 1.5}, "取值不合法"),
     ({"kind": "reach_area", "platforms": ["blue_1"], "lon_min": 122, "alive": "yes"}, "取值不合法"),
+    ({"kind": "route_points", "platforms": ["blue_1"]}, "缺少字段 min_count"),
 ])
 def test_invalid_checks_are_dropped_with_a_note(item: Any, message: str) -> None:
     checks, notes = parse_requirement_checks({"checks": [item]})
@@ -238,7 +239,7 @@ def test_fire_phases_last_window_includes_its_end() -> None:
 
 
 def test_engagement_range_lists_the_spans_inside_the_envelope() -> None:
-    """相向飞行约 200 s 后进入 100 km; 红机约 316 s 飞完航路, 之后的位置不推算。"""
+    """相向飞行约 200 s 后进入 100 km; 红机约 317 s 飞完航路, 之后的位置不推算。"""
     scenario = _scenario([_shot("long", "blue_1", "red_1", 0.0)])
     issues = _issues(_check("engagement_range", max_km=100.0), scenario)
 
@@ -248,6 +249,7 @@ def test_engagement_range_lists_the_spans_inside_the_envelope() -> None:
     span = issues[0].split("包络内的时段是 ")[1].split("s;")[0]
     start, end = (float(value) for value in span.split("-"))
     assert 190 <= start <= 210 and 305 <= end <= 320
+    assert "离端点留 15s 以上余量" in issues[0]
 
 
 def test_engagement_range_without_any_span_says_so() -> None:
@@ -256,8 +258,26 @@ def test_engagement_range_without_any_span_says_so() -> None:
     assert len(issues) == 1 and "之前两者都不在包络内" in issues[0]
 
 
-def test_engagement_range_skips_shots_it_cannot_place() -> None:
+def test_engagement_range_reports_shots_after_the_route_ends() -> None:
+    """rerun 实测: 红方航路 624 s 就飞完, 1300 s 的射击被跳过, 外部按终点位置量出 136 km。"""
     scenario = _scenario([_shot("after_route", "blue_1", "red_1", 500.0)])
+    issues = _issues(_check("engagement_range", max_km=100.0), scenario)
+
+    assert len(issues) == 1
+    assert (
+        "交战 after_route 在 500s 开火时航路已经飞完 (blue_1 的航路 396s 飞完、red_1 的航路 317s 飞完)"
+        in issues[0]
+    )
+    assert "请续上航点让航路覆盖到开火时刻" in issues[0]
+    assert "包络内的时段是 " in issues[0]
+
+
+def test_engagement_range_skips_legs_without_speed() -> None:
+    """航段缺速度推算不出位置, 由航路检查负责报, 这里不重复。"""
+    scenario = _scenario([_shot("no_speed", "blue_1", "red_1", 100.0)])
+    for platform in scenario.platforms:
+        for point in platform.route:
+            point.speed_mps = None
     assert _issues(_check("engagement_range", max_km=100.0), scenario) == []
 
 
@@ -309,12 +329,29 @@ def test_reach_area_unreachable_reports_the_flown_extent() -> None:
     assert "进不了要求区域 (经度 ≥122.5°E)" in issues[0] and "飞到的范围是" in issues[0]
 
 
+def test_reach_area_suggests_an_entry_target_away_from_the_window_edges() -> None:
+    """rerun 实测: 只给速度区间时进区时刻在 897/898 s 和要求的 900 s 之间来回拉扯。"""
+    early = _issues(_check("reach_area", platforms=["blue_1"], lon_min=121.5, start_s=300.0, end_s=400.0))
+    late = _issues(_check("reach_area", platforms=["blue_1"], lon_min=121.5, end_s=150.0))
+
+    assert len(early) == 1 and "进区前航程改到约 81 km 可在 325s 左右进区" in early[0]
+    assert len(late) == 1 and "进区前航程改到约 23 km 可在 90s 左右进区" in late[0]
+
+
 def test_altitude_and_speed_limits_are_checked_per_point() -> None:
     altitude = _issues(_check("altitude_range", platforms=["side:red"], max_m=5000.0))
     speed = _issues(_check("speed_range", platforms=["blue_1"], max_mps=200.0))
 
     assert len(altitude) == 2 and "red_1 的高度 初始位置 8000m、航点1 8000m" in altitude[0]
     assert len(speed) == 1 and "航点1 250m/s" in speed[0]
+
+
+def test_route_points_reports_the_shortfall_and_the_time_budget() -> None:
+    assert _issues(_check("route_points", platforms=["side:blue"], min_count=1)) == []
+
+    issues = _issues(_check("route_points", platforms=["side:blue"], min_count=4))
+    assert len(issues) == 2
+    assert "blue_1 只有 1 个航点, 要求至少 4 个; 当前航路预计 396s 飞完 (任务 1800s)" in issues[0]
 
 
 def test_platforms_missing_from_the_scenario_are_reported() -> None:

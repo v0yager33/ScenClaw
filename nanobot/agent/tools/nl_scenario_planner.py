@@ -230,8 +230,11 @@ _HARD_RULES = """强约束 (违反任何一条都会被校验器打回):
 _IMPLICIT_ENGAGEMENT_RULES = """
 **交战按开火时刻结算** (WSF_IMPLICIT_WEAPON): 不模拟导弹飞行, 开火瞬间就摧毁目标,
 被毁平台随即从仿真中删除; 命中也不看距离, 射程完全靠你在规划里保证。因此:
-- 开火时刻要按航路速度推算双方位置, 距离落在需求给出的交战包络内
-  (需求没给就以我方传感器探测得到目标为准);
+- 开火时刻要按航路速度推算双方位置, 距离落在需求给出的交战包络内并留几公里余量
+  (需求没给就以我方传感器探测得到目标为准); 时刻、距离都不要卡在边界上,
+  否则之后改航路时很容易又滑出去;
+- 开火时双方都还要在航路上: 航路飞完后平台怎么飞不由 IR 决定, 开火时刻晚于任一方
+  最后一个航点的到达时刻, 距离就没有保证; 后段还要开火或被打的平台, 航路要续到那之后;
 - 对射时先开火的一方直接摧毁对方 —— 不要写"A 先射 B、B 稍后回射 A",
   后一条永远不会发生; 要让双方都打出射击, B 必须在被击毁之前先打别的目标;
 - 被击毁的平台此后的航点都不会飞到: 需求要求某平台在某时刻之后完成的航段
@@ -1808,7 +1811,7 @@ def _parse_json_object(
 
     即使开了服务端 JSON 模式, 模型偶尔还是会包一层 markdown 代码块或在前后带上
     说明文字, 所以这里保留一层容错剥离。``close_unbalanced`` 为真 (模型正常收尾)
-    时, 还会补上结尾漏写的一两个闭合符。
+    时, 还会补上漏写的一两个闭合符 (结尾或中途)。
     """
     text = (raw or "").strip()
     if not text:
@@ -1861,16 +1864,20 @@ _MAX_MISSING_CLOSERS = 2
 
 
 def _close_unbalanced(text: str) -> dict[str, Any] | None:
-    """补上结尾漏写的闭合符; 补不了或补完仍不合法时返回 None。
+    """补上漏写的闭合符; 补不了或补完仍不合法时返回 None。
 
-    实测: 模型正常收尾的补丁漏了最外层的 "}", 整轮被当成非法 JSON 丢掉。只在正文
-    以闭合符结尾、没停在字符串中间、缺的不超过两个时补 —— 缺得多说明结构本身乱了,
-    补出来的嵌套未必是模型的本意。
+    实测: 模型正常收尾的补丁漏了最外层的 "}", 整轮被当成非法 JSON 丢掉; 另一次是
+    列表中途漏了 "]" 就写了外层的 "}", 修复轮模型又删掉别处的 "}" 去凑配对, 顶层
+    字段全嵌进了 mission, 四轮都没修回来。遇到配不上的闭合符时, 在它前面补齐栈里
+    更内层的闭合符; 结尾缺的照样补上。只在正文以闭合符结尾、没停在字符串中间、
+    一共缺的不超过两个时补 —— 缺得多说明结构本身乱了, 补出来的嵌套未必是模型的本意。
     """
     body = text.rstrip("` \t\r\n")
     if not body.endswith(("}", "]")):
         return None
     pending: list[str] = []
+    repaired: list[str] = []
+    inserted = 0
     in_string = escaped = False
     for char in body:
         if in_string:
@@ -1885,12 +1892,18 @@ def _close_unbalanced(text: str) -> dict[str, Any] | None:
         elif char in "{[":
             pending.append("}" if char == "{" else "]")
         elif char in "}]":
-            if not pending or pending.pop() != char:
+            if char not in pending:
                 return None
-    if in_string or not pending or len(pending) > _MAX_MISSING_CLOSERS:
+            while pending[-1] != char:
+                repaired.append(pending.pop())
+                inserted += 1
+            pending.pop()
+        repaired.append(char)
+    missing = inserted + len(pending)
+    if in_string or not missing or missing > _MAX_MISSING_CLOSERS:
         return None
     try:
-        parsed = json.loads(body + "".join(reversed(pending)))
+        parsed = json.loads("".join(repaired) + "".join(reversed(pending)))
     except json.JSONDecodeError:
         return None
     return parsed if isinstance(parsed, dict) else None
