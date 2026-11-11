@@ -1250,6 +1250,60 @@ def test_refine_patch_is_merged_onto_the_previous_version() -> None:
     assert "__patch__" in refine_prompt and "按 id" in refine_prompt
 
 
+def test_patch_hoists_physical_fields_written_into_the_intents() -> None:
+    """rerun 实测: 补丁把物理平台的 position、heading_deg 和航点写进了 mission.platforms。"""
+    base = _valid_ir()
+    moved = {"latitude_deg": 27.4, "longitude_deg": 121.1, "altitude_m": 9000.0}
+    route = [{**_EXTRA_LEG, "heading_deg": 30.0}]
+    merged, errors = planner_module.apply_ir_patch(base, {"mission": {"platforms": [
+        {"platform_id": "blue_awacs", "position": moved, "heading_deg": 80.0, "route": route},
+        {"platform_id": "red_radar", "type_hint": "制导雷达阵地"},
+    ]}})
+
+    assert errors == []
+    platform = merged["platforms"][0]
+    assert (platform["position"], platform["heading_deg"], platform["route"]) == (moved, 80.0, route)
+    assert merged["mission"]["platforms"][0] == base["mission"]["platforms"][0]
+    assert merged["mission"]["platforms"][1]["type_hint"] == "制导雷达阵地"
+
+
+def test_null_physical_fields_in_the_intents_are_dropped() -> None:
+    """rerun 实测: 上一版报意图里多了 position 后, 补丁在 mission.platforms 里写 null 想删掉它。"""
+    base = _valid_ir()
+    merged, errors = planner_module.apply_ir_patch(base, {"mission": {"platforms": [
+        {"platform_id": "blue_awacs", "position": None, "heading_deg": None},
+    ]}})
+
+    assert errors == []
+    assert merged["platforms"] == base["platforms"]
+    assert merged["mission"]["platforms"] == base["mission"]["platforms"]
+
+
+def test_patch_with_a_physical_field_in_both_places_is_rejected() -> None:
+    position = _valid_ir()["platforms"][1]["position"]
+    merged, errors = planner_module.apply_ir_patch(_valid_ir(), {
+        "mission": {"platforms": [{"platform_id": "red_radar", "position": position}]},
+        "platforms": [{"platform_id": "red_radar", "position": position}],
+    })
+
+    assert merged is None
+    assert any("red_radar" in error and "无法确定" in error for error in errors)
+
+
+def test_physical_platforms_left_inside_the_mission_are_hoisted() -> None:
+    """rerun 实测: 写完意图没闭合 mission 就写物理平台, 后一个 "platforms" 键覆盖了前一个。"""
+    position = _valid_ir()["platforms"][1]["position"]
+    intent = _dumps([{"platform_id": "red_radar", "initial_position": position}])
+    physical = _dumps([{"platform_id": "red_radar", "position": position, "heading_deg": 0.0}])
+    patch = f'{{"__patch__": {{"mission": {{"platforms": {intent}, "platforms": {physical}}}}}}}'
+    llm = ScriptedLLM([_dumps(_overlapping_ir()), patch])
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=2).plan("任务")
+
+    assert result.success and result.advisories == []
+    assert result.scenario_ir["platforms"][1]["position"] == position
+    assert result.scenario_ir["mission"]["platforms"][1]["initial_position"] == position
+
+
 def test_patch_without_ids_is_repaired_against_the_previous_version() -> None:
     position = _valid_ir()["platforms"][1]["position"]
     llm = ScriptedLLM([
@@ -1421,6 +1475,23 @@ def test_revision_thought_out_retry_does_not_use_up_a_repair_round() -> None:
     assert [a.stage for a in result.attempts] == ["extract", "refine", "refine"]
 
 
+def test_thought_out_refine_retry_lists_fewer_issues(monkeypatch) -> None:
+    """rerun 实测: 56 条问题的 refine 带着同一份清单重问, 又一次耗尽推理预算。"""
+    issues = [f"问题 {number}" for number in range(30)]
+    monkeypatch.setattr(planner_module, "check_ir_plausibility", lambda _scenario: issues)
+    llm = FinishReasonLLM(
+        [(_dumps(_valid_ir()), "stop"), (_PARTIAL_REPLY, "length"), (_dumps(_valid_ir()), "stop")],
+        usages=[None, _THOUGHT_OUT_USAGE, None],
+    )
+    ScenarioIRPlanner(llm=llm, max_repair_rounds=2).plan("任务")
+
+    assert len(llm.calls) == 3
+    first, retry = llm.calls[1][-1]["content"], llm.calls[2][-1]["content"]
+    assert "- 问题 29\n" in first
+    assert "- 问题 11\n" in retry and "- 问题 12\n" not in retry
+    assert "另有 18 条未列出" in retry and "只输出改动的补丁" in retry
+
+
 def test_schema_slip_in_the_last_revision_is_still_repaired() -> None:
     """末轮补丁多写一个顶层键被 schema 拒掉时仍补一次 repair, 不把这一轮的修改丢掉。"""
     llm = ScriptedLLM([
@@ -1588,6 +1659,31 @@ def test_extracted_intents_follow_the_platforms() -> None:
     synced = result.scenario_ir["mission"]["platforms"][1]
     assert synced["initial_position"] == ir["platforms"][1]["position"]
     assert any("red_radar" in note for note in result.normalizations)
+
+
+def test_omitted_intent_tracks_are_filled_without_a_note() -> None:
+    """提示词让意图不写位置和航路, 由代码按物理平台填写; 这不算对不上。"""
+    ir = _synced_ir()
+    for intent in ir["mission"]["platforms"]:
+        del intent["initial_position"]
+        intent.pop("route", None)
+
+    assert planner_module._sync_intents(ir) == []
+    assert ir["mission"]["platforms"] == _synced_ir()["mission"]["platforms"][:1] + [
+        {**_synced_ir()["mission"]["platforms"][1], "route": []}
+    ]
+    result = ScenarioIRPlanner(llm=ScriptedLLM([_dumps(ir)])).plan("任务")
+    assert result.success and result.normalizations == []
+
+
+def test_system_prompt_writes_tracks_once_and_asks_for_compact_json() -> None:
+    llm = ScriptedLLM([_dumps(_valid_ir())])
+    ScenarioIRPlanner(llm=llm).plan("任务")
+    system_prompt = llm.calls[0][0]["content"]
+
+    assert '"initial_position":' not in system_prompt
+    assert "意图里不写 initial_position 和 route" in system_prompt
+    assert "不缩进、不换行" in system_prompt
 
 
 def test_patched_route_keeps_the_intent_in_step() -> None:

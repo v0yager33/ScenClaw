@@ -149,8 +149,6 @@ _IR_SHAPE = """{
         "side": "blue|red|neutral",
         "domain": "air|land|sea|space",
         "type_hint": "自然语言机型/装备描述, 如 J-16 电子战机",
-        "initial_position": {"latitude_deg": 27.5, "longitude_deg": 122.5, "altitude_m": 8000.0},
-        "route": [{"latitude_deg": 27.8, "longitude_deg": 122.2, "altitude_m": 8000.0}],
         "capabilities": ["sead", "jamming"]
       }
     ],
@@ -213,6 +211,8 @@ _HARD_RULES = """强约束 (违反任何一条都会被校验器打回):
 1. 未列出的字段一律不要出现 —— schema 是 extra="forbid", 多写一个字段就整份失败。
 2. selected_coa.mission_id 必须等于 mission.mission_id。
 3. mission.platforms 与顶层 platforms 的 platform_id 集合必须完全相同 (不多不少)。
+   意图里不写 initial_position 和 route: 位置和航路只在顶层 platforms[] 里写一次,
+   代码按它们填写意图。
 4. platform_id / mission_id / sensor_type_id / instance_name / *_id 只能用
    字母开头 + 字母数字下划线连字符, 不要中文、空格、点号。
 5. 顶层 platforms[].sensors[].sensor_type_id 必须在 sensors[] 里定义过。
@@ -280,7 +280,12 @@ _PATCH_FORMAT = f"""输出格式: 上一版 IR 就在对话里, 只输出改动�
 - platforms、mission.platforms、engagements、assertions、sensors 和 platforms[].weapons 按 id (platform_id、engagement_id、assertion_id、sensor_type_id、instance_name) 合并: 只列要改的元素, 没列出的保持原样; 新 id 追加到末尾; 元素里写 "{_DELETE_MARK}": true 表示删除它;
 - 其余列表 (route、platforms[].sensors、assumptions、rationale、assignments 等) 整体替换, 要写出改后的完整列表;
 - 嵌套字段写在所属对象里, 比如 mission.platforms 写成 {{"mission": {{"platforms": [...]}}}}, 不要写成顶层键 mission_platforms。
+- 意图 (mission.platforms) 的初始位置和航路由代码按顶层 platforms[] 同步: 改位置或航路只改顶层 platforms[] 的 position、route, 不要写进 mission.platforms;
 示例: {{"{_PATCH_KEY}": {{"engagements": [{{"engagement_id": "e1", "fire_time_s": 900.0}}, {{"engagement_id": "e2", "{_DELETE_MARK}": true}}], "platforms": [{{"platform_id": "red_f1", "route": [...]}}]}}}}"""
+
+# 修订轮推理耗尽后重问时只列这么多条问题: 实测 56 条问题的 refine 连续两次耗尽推理预算,
+# 带着同一份清单催它"先修一部分"并不管用
+_NARROWED_REFINE_LIMIT = 12
 
 _REVISION_NUDGE = (
     "注意: 上一次回答没能在输出预算内写完 (思考过程或整份重抄占满了 max_tokens)。上一版 IR "
@@ -377,7 +382,8 @@ ScenarioIR 结构 (注释仅供理解, 输出时不要带注释):
 如果需求根本不属于 AFSIM 作战/航空航天交战仿真 (例如交通客流、经济、社会仿真),
 不要硬编一个想定, 直接输出: {{"{sentinel}": "说明为什么超出范围"}}
 
-只输出 JSON 对象本身, 不要 markdown 代码块, 不要任何解释文字。"""
+只输出 JSON 对象本身, 不要 markdown 代码块, 不要任何解释文字。
+用紧凑格式输出 (不缩进、不换行): 缩进排版会多占约四分之一的输出预算。"""
 
 
 # ═══════════════════════════════════════════════════════
@@ -625,6 +631,9 @@ def _sync_intents(payload: dict[str, Any]) -> list[str]:
     一起重写, 意图里的初始经度抄成了 121.31 (物理平台是 121.32)。原先只在上一版两者一致
     时才同步, rerun 里 repair 把 24 架的意图航路都缩写成一个点, 下一版补全航路时漏改了
     4 架挪过的初始位置, 因为上一版本来就不一致, 交付的 IR 里这 4 架就对不上了。
+
+    提示词让意图不写位置和航路 (只在 platforms[] 里写一次, 省输出预算), 没写的由这里
+    填写, 不记入说明; 写了却对不上的才记入。
     """
     intents = _entries_by_id(_mission_platforms(payload))
     synced: list[str] = []
@@ -633,9 +642,11 @@ def _sync_intents(payload: dict[str, Any]) -> list[str]:
         track = _platform_track(platform)
         if intent is None or track is None or _intent_track(intent) == track:
             continue
+        omitted = "initial_position" not in intent and "route" not in intent
         intent["initial_position"] = copy.deepcopy(platform["position"])
         intent["route"] = [copy.deepcopy(point["position"]) for point in platform.get("route") or []]
-        synced.append(platform_id)
+        if not omitted:
+            synced.append(platform_id)
     if not synced:
         return []
     return [
@@ -1414,6 +1425,15 @@ class ScenarioIRPlanner:
                         # 末轮补丁又因 schema 小错作废, 42 条问题最后只修掉 3 条
                         round_budget += 1
                     if nudge not in request_message:
+                        narrow = (
+                            stage == "refine" and working is not None
+                            and len(working.advisories) > _NARROWED_REFINE_LIMIT
+                        )
+                        if narrow:
+                            # 推理耗尽多半是一次要修的问题太多: 重问时只列前几条, 其余下一轮再列
+                            request_message = self._build_refine_prompt(
+                                working.advisories, working_scenario, limit=_NARROWED_REFINE_LIMIT
+                            )
                         conversation = [
                             *conversation[:-1],
                             {"role": "user",
@@ -1699,9 +1719,8 @@ class ScenarioIRPlanner:
         )
 
     def _build_refine_prompt(
-        self, advisories: list[str], scenario: ScenarioIR | None = None
+        self, advisories: list[str], scenario: ScenarioIR | None = None, limit: int = 40
     ) -> str:
-        limit = 40
         listed = "\n".join(f"- {a}" for a in advisories[:limit])
         if len(advisories) > limit:
             listed += f"\n- (另有 {len(advisories) - limit} 条未列出, 修完上面这些后会再列出)"
@@ -1926,6 +1945,7 @@ def apply_ir_patch(
         return None, [f"{_PATCH_KEY} 的值应该是对象, 实际是 {type(patch).__name__}"]
     errors: list[str] = []
     patch = _fold_path_keys(patch, errors)
+    patch = _hoist_physical_fields(patch, errors)
     merged = _merge_fields(copy.deepcopy(base), patch, (), errors)
     return (None, errors) if errors else (merged, [])
 
@@ -1955,6 +1975,72 @@ def _fold_path_keys(patch: dict[str, Any], errors: list[str]) -> dict[str, Any]:
                 continue
             folded[parent] = {**holder, child: value}
     return folded
+
+
+# 只有物理平台 (顶层 platforms[]) 才有的字段; 出现在意图里说明补丁写错了位置
+_PHYSICAL_ONLY_FIELDS = ("platform_type", "position", "heading_deg", "mover_type", "sensors", "weapons")
+
+
+def _hoist_physical_fields(patch: dict[str, Any], errors: list[str]) -> dict[str, Any]:
+    """把写进 mission.platforms 的物理平台字段挪到顶层 platforms 再合并。
+
+    实测: 补丁在 mission 里写完意图后没闭合 mission 就接着写物理平台, mission 里出现两个
+    "platforms" 键, 解析时后一个覆盖前一个; 意图里多出 position、heading_deg 被 schema
+    拒掉, 这一轮 8 架的航路修改整份作废。意图的位置和航路本来就由代码按物理平台同步,
+    挪过去不丢信息。航路按航点形状判断: 物理航点是 {"position": ..., "speed_mps": ...}。
+    """
+    mission = patch.get("mission")
+    intents = mission.get("platforms") if isinstance(mission, dict) else None
+    physical = patch.get("platforms", [])
+    if not isinstance(intents, list) or not isinstance(physical, list):
+        return patch
+    physical = [dict(entry) if isinstance(entry, dict) else entry for entry in physical]
+    targets = {
+        entry["platform_id"]: entry for entry in physical
+        if isinstance(entry, dict) and isinstance(entry.get("platform_id"), str)
+    }
+    kept: list[Any] = []
+    changed = False
+    for intent in intents:
+        platform_id = intent.get("platform_id") if isinstance(intent, dict) else None
+        if not isinstance(platform_id, str):
+            kept.append(intent)
+            continue
+        # 写成 null 是想删掉意图里不该有的字段 (实测上一版报 Extra inputs 后模型这样修),
+        # 不是要删物理平台的位置: 直接丢掉, 不挪
+        dropped = {key for key in _PHYSICAL_ONLY_FIELDS if key in intent and intent[key] is None}
+        moved = {key: intent[key] for key in _PHYSICAL_ONLY_FIELDS if intent.get(key) is not None}
+        if _is_physical_route(intent.get("route")):
+            moved["route"] = intent["route"]
+        target = targets.get(platform_id)
+        clash = sorted(set(moved) & set(target or {}))
+        if clash:
+            errors.append(
+                f"补丁里 mission.platforms 的 {platform_id} 写了物理平台字段 {'、'.join(clash)},"
+                " 顶层 platforms 里也写了, 无法确定以哪个为准; 位置和航路只写在顶层 platforms 里"
+            )
+        if clash or not (moved or dropped):
+            kept.append(intent)
+            continue
+        if moved:
+            if target is None:
+                target = targets[platform_id] = {"platform_id": platform_id}
+                physical.append(target)
+            target.update(moved)
+        changed = True
+        rest = {
+            key: value for key, value in intent.items() if key not in moved and key not in dropped
+        }
+        if len(rest) > 1:  # 只剩 platform_id 时整条去掉
+            kept.append(rest)
+    if not changed:
+        return patch
+    return {**patch, "mission": {**mission, "platforms": kept}, "platforms": physical}
+
+def _is_physical_route(route: Any) -> bool:
+    return isinstance(route, list) and bool(route) and all(
+        isinstance(point, dict) and "position" in point for point in route
+    )
 
 
 def _merge_fields(
