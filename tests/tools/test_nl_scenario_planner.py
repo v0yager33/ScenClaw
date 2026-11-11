@@ -775,6 +775,8 @@ def test_reasoning_heavy_partial_refine_is_nudged_once() -> None:
     assert retry[-1]["content"].startswith(llm.calls[1][-1]["content"])
     # 修订轮的上一版就在对话里: 催它只输出补丁, 不再整份重抄
     assert "只输出改动的补丁" in retry[-1]["content"]
+    # rerun 实测: 没有这句时重问照样逐条推演, 第二次又耗尽; extract 的催促有这句, 重问推理几乎为 0
+    assert "少做逐条推演" in retry[-1]["content"]
 
 
 def test_repeated_thought_out_refine_keeps_best_without_more_retries() -> None:
@@ -1267,7 +1269,7 @@ def test_patch_hoists_physical_fields_written_into_the_intents() -> None:
     assert merged["mission"]["platforms"][1]["type_hint"] == "制导雷达阵地"
 
 
-def test_null_physical_fields_in_the_intents_are_dropped() -> None:
+def test_null_physical_fields_in_the_intents_are_not_hoisted() -> None:
     """rerun 实测: 上一版报意图里多了 position 后, 补丁在 mission.platforms 里写 null 想删掉它。"""
     base = _valid_ir()
     merged, errors = planner_module.apply_ir_patch(base, {"mission": {"platforms": [
@@ -1277,6 +1279,30 @@ def test_null_physical_fields_in_the_intents_are_dropped() -> None:
     assert errors == []
     assert merged["platforms"] == base["platforms"]
     assert merged["mission"]["platforms"] == base["mission"]["platforms"]
+
+    # 上一版意图里真写错了 position 时, null 照常把它删掉
+    broken = _valid_ir()
+    broken["mission"]["platforms"][0]["position"] = broken["platforms"][0]["position"]
+    merged, errors = planner_module.apply_ir_patch(broken, {"mission": {"platforms": [
+        {"platform_id": "blue_awacs", "position": None},
+    ]}})
+    assert errors == [] and merged["mission"]["platforms"] == base["mission"]["platforms"]
+
+
+def test_patch_moves_plan_fields_written_into_the_mission() -> None:
+    """rerun 实测: refine 补丁把方案的 summary、assignments、rationale 写进了 mission。"""
+    base = _valid_ir()
+    merged, errors = planner_module.apply_ir_patch(base, {"mission": {
+        "summary": "新方案", "rationale": ["理由"], "assumptions": ["假设"],
+    }})
+
+    assert errors == []
+    assert (merged["selected_coa"]["summary"], merged["selected_coa"]["rationale"]) == ("新方案", ["理由"])
+    assert merged["mission"] == {**base["mission"], "assumptions": ["假设"]}
+    merged, errors = planner_module.apply_ir_patch(base, {
+        "mission": {"summary": "甲"}, "selected_coa": {"summary": "乙"},
+    })
+    assert merged is None and any("无法确定" in error for error in errors)
 
 
 def test_patch_with_a_physical_field_in_both_places_is_rejected() -> None:
@@ -1539,7 +1565,7 @@ def test_missing_closers_are_added_only_when_safe() -> None:
         '{"a": {"b": "未闭合',            # 停在字符串中间
         '{"a": {"b": [1',                 # 不以闭合符结尾
         '{"a": {"b": {"c": {"d": 1}',     # 缺得太多
-        '{"a": [1}}',                     # 闭合符配不上
+        '{"a": [1}}}',                    # 闭合符多了一个
         '{"a": {"b": {"c": [1}',          # 中途补一个、结尾还缺两个, 超过上限
     ):
         assert _parse_json_object(text, close_unbalanced=True)[0] is None, text
@@ -1556,6 +1582,23 @@ def test_closers_missing_mid_stream_are_added_before_the_mismatch() -> None:
     llm = FinishReasonLLM([(ir[:cut] + ir[cut + 1:], "stop")])
     result = ScenarioIRPlanner(llm=llm).plan("任务")
     assert result.success and result.attempts[0].ok
+
+
+def test_closer_written_as_the_wrong_kind_is_replaced() -> None:
+    """rerun 实测: extract 在列表末尾把 "]" 写成了 "}", 补闭合符会让顶层提前闭合。"""
+    assert _parse_json_object('{"a": [1}}', close_unbalanced=True) == ({"a": [1]}, [])
+    text = '{"a": {"b": ["x", "y"}}, "c": 1}'
+    assert _parse_json_object(text, close_unbalanced=True) == ({"a": {"b": ["x", "y"]}, "c": 1}, [])
+    assert _parse_json_object(text)[0] is None  # 默认不修
+
+    ir = _dumps(_valid_ir())
+    cut = ir.index("]}")
+    llm = FinishReasonLLM([(ir[:cut] + "}" + ir[cut + 1:], "stop")])
+    result = ScenarioIRPlanner(llm=llm).plan("任务")
+    assert result.success and result.attempts[0].ok
+    assert result.scenario_ir == ScenarioIRPlanner(
+        llm=ScriptedLLM([ir])
+    ).plan("任务").scenario_ir
 
 
 def test_finished_patch_missing_its_last_brace_is_merged() -> None:

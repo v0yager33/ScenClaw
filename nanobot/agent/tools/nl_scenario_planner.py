@@ -279,7 +279,7 @@ _PATCH_FORMAT = f"""输出格式: 上一版 IR 就在对话里, 只输出改动�
 - 对象按键合并, 只写要改的键; 值写 null 表示删掉这个键;
 - platforms、mission.platforms、engagements、assertions、sensors 和 platforms[].weapons 按 id (platform_id、engagement_id、assertion_id、sensor_type_id、instance_name) 合并: 只列要改的元素, 没列出的保持原样; 新 id 追加到末尾; 元素里写 "{_DELETE_MARK}": true 表示删除它;
 - 其余列表 (route、platforms[].sensors、assumptions、rationale、assignments 等) 整体替换, 要写出改后的完整列表;
-- 嵌套字段写在所属对象里, 比如 mission.platforms 写成 {{"mission": {{"platforms": [...]}}}}, 不要写成顶层键 mission_platforms。
+- 嵌套字段写在所属对象里, 比如 mission.platforms 写成 {{"mission": {{"platforms": [...]}}}}, 不要写成顶层键 mission_platforms; 方案的 summary、assignments、rationale 写在 selected_coa 里, 不要写进 mission。
 - 意图 (mission.platforms) 的初始位置和航路由代码按顶层 platforms[] 同步: 改位置或航路只改顶层 platforms[] 的 position、route, 不要写进 mission.platforms;
 示例: {{"{_PATCH_KEY}": {{"engagements": [{{"engagement_id": "e1", "fire_time_s": 900.0}}, {{"engagement_id": "e2", "{_DELETE_MARK}": true}}], "platforms": [{{"platform_id": "red_f1", "route": [...]}}]}}}}"""
 
@@ -291,7 +291,7 @@ _REVISION_NUDGE = (
     "注意: 上一次回答没能在输出预算内写完 (思考过程或整份重抄占满了 max_tokens)。上一版 IR "
     "就在对话里, 不要整份重抄, 只输出改动的补丁 "
     f'{{"{_PATCH_KEY}": {{...}}}}; 各条问题附带的时段、速度等数值已经算好, 直接采用, '
-    "不必重算; 问题很多时先修一部分。"
+    "不必重算。请少做逐条推演, 直接输出补丁; 问题很多时先修一部分, 没修完的下一轮会再列出。"
 )
 
 _AUDIT_THOUGHT_OUT_NUDGE = (
@@ -1884,24 +1884,41 @@ def _json_context(text: str, position: int, width: int = 60) -> str:
     return (before + "⟦此处⟧" + after).replace("\n", " ")
 
 
-_MAX_MISSING_CLOSERS = 2
+_MAX_CLOSER_FIXES = 2
 
 
 def _close_unbalanced(text: str) -> dict[str, Any] | None:
-    """补上漏写的闭合符; 补不了或补完仍不合法时返回 None。
+    """补上漏写或换掉写错的闭合符; 修不了或修完仍不合法时返回 None。
 
     实测: 模型正常收尾的补丁漏了最外层的 "}", 整轮被当成非法 JSON 丢掉; 另一次是
     列表中途漏了 "]" 就写了外层的 "}", 修复轮模型又删掉别处的 "}" 去凑配对, 顶层
-    字段全嵌进了 mission, 四轮都没修回来。遇到配不上的闭合符时, 在它前面补齐栈里
-    更内层的闭合符; 结尾缺的照样补上。只在正文以闭合符结尾、没停在字符串中间、
-    一共缺的不超过两个时补 —— 缺得多说明结构本身乱了, 补出来的嵌套未必是模型的本意。
+    字段全嵌进了 mission, 四轮都没修回来。遇到配不上的闭合符时, 先试在它前面补齐栈里
+    更内层的闭合符; 补完不合法再试把它换成栈顶该有的那个 (实测 extract 在列表末尾把
+    "]" 写成了 "}", 补闭合符会让顶层提前闭合)。结尾缺的照样补上。只在正文以闭合符结尾、
+    没停在字符串中间、一共改动不超过两处时修 —— 改得多说明结构本身乱了, 修出来的
+    嵌套未必是模型的本意。
     """
     body = text.rstrip("` \t\r\n")
     if not body.endswith(("}", "]")):
         return None
+    for substitute in (False, True):
+        repaired = _rebalance_closers(body, substitute)
+        if repaired is None:
+            continue
+        try:
+            parsed = json.loads(repaired)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _rebalance_closers(body: str, substitute: bool) -> str | None:
+    """按括号栈修正闭合符: substitute 为假时补上漏写的, 为真时换掉写错的; 结尾缺的都补上。"""
     pending: list[str] = []
     repaired: list[str] = []
-    inserted = 0
+    fixes = 0
     in_string = escaped = False
     for char in body:
         if in_string:
@@ -1916,21 +1933,24 @@ def _close_unbalanced(text: str) -> dict[str, Any] | None:
         elif char in "{[":
             pending.append("}" if char == "{" else "]")
         elif char in "}]":
-            if char not in pending:
+            if not pending:
                 return None
-            while pending[-1] != char:
-                repaired.append(pending.pop())
-                inserted += 1
+            if char != pending[-1]:
+                if substitute:
+                    char = pending[-1]
+                    fixes += 1
+                elif char not in pending:
+                    return None
+                else:
+                    while pending[-1] != char:
+                        repaired.append(pending.pop())
+                        fixes += 1
             pending.pop()
         repaired.append(char)
-    missing = inserted + len(pending)
-    if in_string or not missing or missing > _MAX_MISSING_CLOSERS:
+    fixes += len(pending)
+    if in_string or not fixes or fixes > _MAX_CLOSER_FIXES:
         return None
-    try:
-        parsed = json.loads("".join(repaired) + "".join(reversed(pending)))
-    except json.JSONDecodeError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
+    return "".join(repaired) + "".join(reversed(pending))
 
 
 def apply_ir_patch(
@@ -1946,6 +1966,7 @@ def apply_ir_patch(
     errors: list[str] = []
     patch = _fold_path_keys(patch, errors)
     patch = _hoist_physical_fields(patch, errors)
+    patch = _move_coa_fields(patch, errors)
     merged = _merge_fields(copy.deepcopy(base), patch, (), errors)
     return (None, errors) if errors else (merged, [])
 
@@ -2007,8 +2028,7 @@ def _hoist_physical_fields(patch: dict[str, Any], errors: list[str]) -> dict[str
             kept.append(intent)
             continue
         # 写成 null 是想删掉意图里不该有的字段 (实测上一版报 Extra inputs 后模型这样修),
-        # 不是要删物理平台的位置: 直接丢掉, 不挪
-        dropped = {key for key in _PHYSICAL_ONLY_FIELDS if key in intent and intent[key] is None}
+        # 不是要删物理平台的位置: 留在意图里按删键处理, 不挪
         moved = {key: intent[key] for key in _PHYSICAL_ONLY_FIELDS if intent.get(key) is not None}
         if _is_physical_route(intent.get("route")):
             moved["route"] = intent["route"]
@@ -2019,28 +2039,60 @@ def _hoist_physical_fields(patch: dict[str, Any], errors: list[str]) -> dict[str
                 f"补丁里 mission.platforms 的 {platform_id} 写了物理平台字段 {'、'.join(clash)},"
                 " 顶层 platforms 里也写了, 无法确定以哪个为准; 位置和航路只写在顶层 platforms 里"
             )
-        if clash or not (moved or dropped):
+        if clash or not moved:
             kept.append(intent)
             continue
-        if moved:
-            if target is None:
-                target = targets[platform_id] = {"platform_id": platform_id}
-                physical.append(target)
-            target.update(moved)
+        if target is None:
+            target = targets[platform_id] = {"platform_id": platform_id}
+            physical.append(target)
+        target.update(moved)
         changed = True
-        rest = {
-            key: value for key, value in intent.items() if key not in moved and key not in dropped
-        }
+        rest = {key: value for key, value in intent.items() if key not in moved}
         if len(rest) > 1:  # 只剩 platform_id 时整条去掉
             kept.append(rest)
     if not changed:
         return patch
     return {**patch, "mission": {**mission, "platforms": kept}, "platforms": physical}
 
+
 def _is_physical_route(route: Any) -> bool:
     return isinstance(route, list) and bool(route) and all(
         isinstance(point, dict) and "position" in point for point in route
     )
+
+
+# 只有方案 (selected_coa) 才有的字段; 出现在 mission 里说明补丁写错了位置
+_COA_ONLY_FIELDS = ("coa_id", "summary", "assignments", "rationale")
+
+
+def _move_coa_fields(patch: dict[str, Any], errors: list[str]) -> dict[str, Any]:
+    """把写进 mission 的方案字段 (summary、assignments、rationale) 挪到 selected_coa 再合并。
+
+    实测: refine 补丁把方案说明写成 {"mission": {"summary": ..., "assignments": ...}}, 被 schema
+    拒掉, 这一轮的航路修改整份作废; 修复轮模型把这几个字段置 null 才通过, 方案说明也丢了。
+    写成 null 的留在 mission 里按删键处理, 和意图里的物理字段一样。
+    """
+    mission = patch.get("mission")
+    coa = patch.get("selected_coa", {})
+    if not isinstance(mission, dict) or not isinstance(coa, dict):
+        return patch
+    moved = {key: mission[key] for key in _COA_ONLY_FIELDS if mission.get(key) is not None}
+    if not moved:
+        return patch
+    clash = sorted(set(moved) & set(coa))
+    if clash:
+        errors.append(
+            f"补丁里 mission 和 selected_coa 都写了 {'、'.join(clash)}, 无法确定以哪个为准;"
+            " 这些字段属于 selected_coa"
+        )
+        return patch
+    rest = {key: value for key, value in mission.items() if key not in moved}
+    result = {**patch, "selected_coa": {**coa, **moved}}
+    if rest:
+        result["mission"] = rest
+    else:
+        del result["mission"]
+    return result
 
 
 def _merge_fields(
