@@ -853,6 +853,15 @@ def test_fact_sheet_reports_fire_range_and_outcomes() -> None:
     assert "again: blue_awacs → red_radar" in sheet and "被跳过: 目标已在 100s" in sheet
 
 
+def test_fact_sheet_flags_only_same_second_return_fire() -> None:
+    """实测: 先开火、一两百秒后才被击毁的射击也被标成"同秒遭射击, 可能打不出"。"""
+    engagement = _duel_ir([_engagement("strike", "blue_awacs", "red_radar", "aam", 600.0)]).engagements[0]
+    later = {"red_radar": (600.0, "strike"), "blue_awacs": (700.0, "other")}
+    same = {"red_radar": (600.0, "strike"), "blue_awacs": (600.0, "other")}
+    assert planner_module._engagement_outcome(engagement, later, implicit=True) == "摧毁目标"
+    assert "同秒遭交战 other 射击" in planner_module._engagement_outcome(engagement, same, implicit=True)
+
+
 def test_audit_revision_is_accepted_and_audited_again() -> None:
     """核对轮发现需求没满足就输出修正版; 修正版问题不多于原版就接受, 并再核对一次。"""
     llm = ScriptedLLM([
@@ -934,13 +943,14 @@ def test_repaired_audit_revision_with_new_issue_still_gets_refined() -> None:
         _dumps(slipped),
         _dumps(repaired_with_overlap),
         _dumps(_single_strike_payload(900.0)),
+        _REQUIREMENTS_MET,
     ])
     result = ScenarioIRPlanner(llm=llm, max_repair_rounds=4, audit_requirements=True).plan("任务")
 
-    assert [a.stage for a in result.attempts] == ["extract", "audit", "repair", "refine"]
+    assert [a.stage for a in result.attempts] == ["extract", "audit", "repair", "refine", "audit"]
     assert json.loads(llm.calls[3][-2]["content"])["engagements"][0]["fire_time_s"] == 900.0
     assert result.scenario_ir["engagements"][0]["fire_time_s"] == 900.0
-    assert result.requirements_audit == "unconfirmed"  # 轮数用完, 最终版没再核对
+    assert result.requirements_audit == "met"  # 末轮 refine 才清零, 补一轮核对
 
 
 def test_null_extra_fields_are_dropped_before_validation() -> None:
@@ -990,6 +1000,28 @@ def test_audit_without_rounds_left_is_skipped() -> None:
     result = ScenarioIRPlanner(llm=llm, max_repair_rounds=1, audit_requirements=True).plan("任务")
     assert result.rounds == 1
     assert result.requirements_audit == ""
+
+
+def test_refine_clearing_issues_in_the_last_round_gets_one_extra_audit() -> None:
+    """实测: refine 用满轮数才清零, 核对被跳过, assumptions 里的战果描述没人对照事实表。"""
+    llm = ScriptedLLM([_dumps(_overlapping_ir()), _dumps(_valid_ir()), _REQUIREMENTS_MET])
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=2, audit_requirements=True).plan("任务")
+    assert [a.stage for a in result.attempts] == ["extract", "refine", "audit"]
+    assert result.requirements_audit == "met"
+
+
+def test_extra_audit_is_granted_only_once() -> None:
+    """实测: 末轮核对改写了击毁时序。改完的版本再核对一次; 还在改就停, 不无限补轮。"""
+    llm = ScriptedLLM([
+        _dumps(_single_strike_payload(600.0)),
+        _dumps(_single_strike_payload(900.0)),
+        _dumps(_single_strike_payload(1200.0)),
+    ])
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=2, audit_requirements=True).plan("任务")
+
+    assert [a.stage for a in result.attempts] == ["extract", "audit", "audit"]
+    assert result.scenario_ir["engagements"][0]["fire_time_s"] == 1200.0
+    assert result.requirements_audit == "unconfirmed"
 
 
 def test_audit_waits_until_generic_issues_are_cleared() -> None:

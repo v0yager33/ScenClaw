@@ -1172,7 +1172,9 @@ def _engagement_outcome(
     if target_kill and target_kill[1] != engagement.engagement_id:
         return f"白白消耗: 同秒已有交战 {target_kill[1]} 射击同一目标"
     outcome = "摧毁目标"
-    if shooter_kill:
+    # 只有射手在开火这一秒挨打才可能打不出; 之后才被击毁不影响这一发 (实测事实表把
+    # 先开火、一两百秒后才被击毁的射击全标成"同秒遭射击", 核对轮对照的是错误的事实)
+    if shooter_kill and shooter_kill[0] == fire_time:
         outcome += f" (射手同秒遭交战 {shooter_kill[1]} 射击, 可能打不出)"
     return outcome
 
@@ -1272,7 +1274,8 @@ class ScenarioIRPlanner:
 
     ``audit_requirements`` 打开时, 通用检查清零后再花一轮做需求核对: 通用检查不知道
     需求里的具体数值, 实测里问题清零的版本初始距离、穿越时刻、开火时段都没达标, 自由
-    文本里还写错了"谁击毁谁"。核对轮把代码推算的事实表交给模型对照原文, 它也占修复轮数。
+    文本里还写错了"谁击毁谁"。核对轮把代码推算的事实表交给模型对照原文, 它也占修复轮数;
+    修订轮用满轮数才清零、最终版还没核对过时补一轮核对 (只补一次)。
 
     ``check_requirements`` 打开时, 拿到第一版合法 IR 后另调用一次模型, 把需求原文里写明
     数值的约束抽成结构化条款 (不计入修复轮数); 之后每一版都由代码逐条核验, 不满足的条款
@@ -1333,6 +1336,8 @@ class ScenarioIRPlanner:
         working_scenario: ScenarioIR | None = None
         best_audited = False
         audit_ran = False
+        # 轮数用完时为未核对的清零版本补过一轮核对
+        audit_extended = False
         requirements_met = False
         refine_nudged = False
         # 已有合法结果后, 改坏 schema 的修订版只补救一次
@@ -1560,7 +1565,14 @@ class ScenarioIRPlanner:
             from_audit = False
 
             if round_index >= round_budget:
-                break
+                # 修订轮刚把问题清零、这一版又还没核对过: 补一轮核对 (只补一次)。实测 refine
+                # 用满轮数才清零, 核对被跳过, 自由文本里的战果描述没人对照事实表; 另一次核对轮
+                # 在末轮改写了 assumptions 里的击毁时序, 改完的版本也没再核对
+                if not (self.audit_requirements and not working.advisories and not best_audited
+                        and stage != "extract" and not audit_extended):
+                    break
+                audit_extended = True
+                round_budget += 1
 
             # 回灌的 IR 与问题清单必须是同一版: 本轮若因问题变多被拒, 就从 best 重新改
             if working.advisories:
@@ -2326,7 +2338,10 @@ _LLM_PARAMS: dict[str, Any] = {
 _PLANNER_PARAMS: dict[str, Any] = {
     "max_repair_rounds": {
         "type": "integer",
-        "description": "Max IR-level repair rounds, the requirements audit included. Default: 3.",
+        "description": (
+            "Max IR-level repair rounds, the requirements audit included; one extra audit "
+            "round is added when a revision clears all issues in the last round. Default: 3."
+        ),
         "minimum": 1,
         "maximum": 8,
     },
