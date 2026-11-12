@@ -124,6 +124,23 @@ def test_parse_accepts_a_bare_list_and_sorts_windows() -> None:
     assert checks[0].params["windows"] == [[0.0, 300.0], [600.0, 900.0]]
 
 
+def test_parse_reads_a_degenerate_envelope_as_an_upper_bound() -> None:
+    checks, notes = parse_requirement_checks({"checks": [
+        {"kind": "engagement_range", "min_km": 100, "max_km": 100, "quote": "使用约100km交战包络"},
+        {"kind": "side_separation", "min_km": 250, "max_km": 250},
+    ]}, _scenario())
+
+    assert checks[0].params == {"max_km": 100.0}
+    # 只有包络按上限理解, 别的距离条款原样保留
+    assert checks[1].params == {"min_km": 250.0, "max_km": 250.0}
+    assert notes == ["第 1 条条款: engagement_range 的 min_km 与 max_km 相同, 包络按上限处理, 已去掉 min_km"]
+
+    # 300 s 时双方斜距约 50 km: 在 100 km 包络之内, 按 100-100 km 就成了不满足
+    scenario = _scenario([_shot("b1_r1", "blue_1", "red_1", 300.0)])
+    assert _issues(checks[0], scenario) == []
+    assert _issues(_check("engagement_range", min_km=100.0, max_km=100.0), scenario)
+
+
 def test_parse_without_a_checks_list_is_noted() -> None:
     assert parse_requirement_checks({"items": []}) == ([], ["条款抽取结果里没有 checks 列表"])
 

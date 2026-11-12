@@ -186,6 +186,19 @@ def test_parse_json_object_rejects_premature_close() -> None:
     assert '"c": 2' in errors[0]
 
 
+def test_parse_json_object_drops_an_early_top_level_closer_when_finished() -> None:
+    """实测: extract 在 assumptions 列表后写了 "]}}", 顶层提前闭合, 后面的 sensors 等整段作废。"""
+    raw = '{"mission": {"assumptions": ["x"]}}, "sensors": [{"id": 1}], "engagements": []}'
+    payload, errors = _parse_json_object(raw, close_unbalanced=True)
+
+    assert errors == []
+    assert payload == {"mission": {"assumptions": ["x"]}, "sensors": [{"id": 1}], "engagements": []}
+    # 模型没正常收尾时不修; 去掉闭合符后仍不合法时也不修
+    assert _parse_json_object(raw)[0] is None
+    payload, errors = _parse_json_object('{"a": 1}, 2}', close_unbalanced=True)
+    assert payload is None and "提前闭合" in errors[0]
+
+
 def test_parse_json_object_reports_syntax_error_location() -> None:
     payload, errors = _parse_json_object('{"a": 1, "b": tru}')
     assert payload is None
@@ -1548,6 +1561,23 @@ def test_thought_out_refine_retry_lists_fewer_issues(monkeypatch) -> None:
     assert "- 问题 29\n" in first
     assert "- 问题 11\n" in retry and "- 问题 12\n" not in retry
     assert "另有 18 条未列出" in retry and "只输出改动的补丁" in retry
+
+
+def test_later_refines_stay_narrowed_after_a_thought_out_refine(monkeypatch) -> None:
+    """rerun 实测: 重问时列 12 条修成了, 下一轮又把 30 条全列出来, 再次耗尽推理预算。"""
+    issues = [f"问题 {number}" for number in range(30)]
+    monkeypatch.setattr(planner_module, "check_ir_plausibility", lambda _scenario: issues)
+    llm = FinishReasonLLM(
+        [(_dumps(_valid_ir()), "stop"), (_PARTIAL_REPLY, "length"),
+         (_dumps(_valid_ir()), "stop"), (_dumps(_valid_ir()), "stop")],
+        usages=[None, _THOUGHT_OUT_USAGE, None, None],
+    )
+    ScenarioIRPlanner(llm=llm, max_repair_rounds=3).plan("任务")
+
+    assert len(llm.calls) == 4
+    later = llm.calls[3][-1]["content"]
+    assert "- 问题 11\n" in later and "- 问题 12\n" not in later
+    assert "另有 18 条未列出" in later
 
 
 def test_schema_slip_in_the_last_revision_is_still_repaired() -> None:

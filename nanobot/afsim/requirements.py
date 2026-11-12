@@ -139,7 +139,10 @@ def parse_requirement_checks(
     for index, item in enumerate(items, 1):
         check, problem = _parse_one(item)
         if check is not None and scenario is not None:
+            parse_note = problem
             check, problem = _bind_selectors(check, scenario)
+            if check is not None:
+                problem = "; ".join(note for note in (parse_note, problem) if note)
         if check is None:
             notes.append(f"丢弃第 {index} 条条款: {problem}")
         else:
@@ -176,9 +179,15 @@ def _parse_one(item: Any) -> tuple[RequirementCheck | None, str]:
             return None, f"{kind} 的 {low} 大于 {high}"
     if kind == "fire_phases" and params["min_count"] > len(params["windows"]):
         return None, "fire_phases 的 min_count 超过时段个数"
+    note = ""
+    # 实测: "使用约100km交战包络" 被抽成 min_km = max_km = 100, 43 km、69 km 的开火都报
+    # "不在 100-100km 内", 要求改航路或换目标。包络是上限, 两端相等时只留上限。
+    if kind == "engagement_range" and "min_km" in params and params.get("max_km") == params["min_km"]:
+        del params["min_km"]
+        note = "engagement_range 的 min_km 与 max_km 相同, 包络按上限处理, 已去掉 min_km"
     quote = item.get("quote")
     quote = quote.strip()[:_QUOTE_LIMIT] if isinstance(quote, str) else ""
-    return RequirementCheck(kind=kind, params=params, quote=quote), ""
+    return RequirementCheck(kind=kind, params=params, quote=quote), note
 
 
 def _coerce(value: Any, field_type: str) -> Any:

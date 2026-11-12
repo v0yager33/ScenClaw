@@ -283,6 +283,8 @@ _PATCH_FORMAT = f"""输出格式: 上一版 IR 就在对话里, 只输出改动�
 - 意图 (mission.platforms) 的初始位置和航路由代码按顶层 platforms[] 同步: 改位置或航路只改顶层 platforms[] 的 position、route, 不要写进 mission.platforms;
 示例: {{"{_PATCH_KEY}": {{"engagements": [{{"engagement_id": "e1", "fire_time_s": 900.0}}, {{"engagement_id": "e2", "{_DELETE_MARK}": true}}], "platforms": [{{"platform_id": "red_f1", "route": [...]}}]}}}}"""
 
+# 修订轮提示一次最多列这么多条问题
+_REFINE_LIMIT = 40
 # 修订轮推理耗尽后重问时只列这么多条问题: 实测 56 条问题的 refine 连续两次耗尽推理预算,
 # 带着同一份清单催它"先修一部分"并不管用
 _NARROWED_REFINE_LIMIT = 12
@@ -1353,6 +1355,9 @@ class ScenarioIRPlanner:
         # 抽取阶段推理耗尽后的第一次重问不占修复轮数: 实测它常让 refine 和核对少一轮
         round_budget = self.max_repair_rounds
         extract_retried = False
+        # 修订轮推理耗尽过一次, 之后的 refine 都只列前几条: 实测重问时列 12 条修成了,
+        # 下一轮又把 30 条问题全列出来, 再次耗尽推理预算, 带着 30 条问题收场
+        refine_limit = _REFINE_LIMIT
         round_index = 0
 
         while round_index < round_budget:
@@ -1422,6 +1427,8 @@ class ScenarioIRPlanner:
                 # 还没有合法 IR 时每轮都值得再试; 已有合法结果时只催一次, 不为 refine 反复烧预算
                 if worth_retry and (best is None or not refine_nudged):
                     refine_nudged = best is not None
+                    if stage == "refine":
+                        refine_limit = _NARROWED_REFINE_LIMIT
                     if best is None and stage == "extract" and not extract_retried:
                         extract_retried = True
                         round_budget += 1
@@ -1432,12 +1439,12 @@ class ScenarioIRPlanner:
                     if nudge not in request_message:
                         narrow = (
                             stage == "refine" and working is not None
-                            and len(working.advisories) > _NARROWED_REFINE_LIMIT
+                            and len(working.advisories) > refine_limit
                         )
                         if narrow:
                             # 推理耗尽多半是一次要修的问题太多: 重问时只列前几条, 其余下一轮再列
                             request_message = self._build_refine_prompt(
-                                working.advisories, working_scenario, limit=_NARROWED_REFINE_LIMIT
+                                working.advisories, working_scenario, limit=refine_limit
                             )
                         conversation = [
                             *conversation[:-1],
@@ -1582,7 +1589,9 @@ class ScenarioIRPlanner:
                     {"role": "assistant",
                      "content": json.dumps(working.scenario_ir, ensure_ascii=False)},
                     {"role": "user",
-                     "content": self._build_refine_prompt(working.advisories, working_scenario)},
+                     "content": self._build_refine_prompt(
+                         working.advisories, working_scenario, limit=refine_limit
+                     )},
                 ]
                 stage = "refine"
                 continue
@@ -1731,7 +1740,7 @@ class ScenarioIRPlanner:
         )
 
     def _build_refine_prompt(
-        self, advisories: list[str], scenario: ScenarioIR | None = None, limit: int = 40
+        self, advisories: list[str], scenario: ScenarioIR | None = None, limit: int = _REFINE_LIMIT
     ) -> str:
         listed = "\n".join(f"- {a}" for a in advisories[:limit])
         if len(advisories) > limit:
@@ -1884,9 +1893,36 @@ def _parse_json_object(
         return None, [f"JSON 语法错误 ({exc.msg}, 第 {exc.pos} 个字符): {_json_context(text, exc.pos)}"]
     if not text[consumed:].strip("}] \t\r\n`"):
         return parsed, []
+    if close_unbalanced:
+        dropped = _drop_early_closers(text, start, consumed)
+        if dropped is not None:
+            return dropped, []
     return None, [
         f"JSON 对象在第 {consumed} 个字符处提前闭合, 后面还有内容: {_json_context(text, consumed)}"
     ]
+
+
+def _drop_early_closers(text: str, start: int, consumed: int) -> dict[str, Any] | None:
+    """去掉让顶层提前闭合的多余闭合符; 去掉后仍不合法时返回 None。
+
+    实测: 12v12 的 extract 在 mission.assumptions 列表后写了 ``"]}}``, 顶层在第 6600 个字符处
+    闭合, 后面的 sensors、engagements 全成了多余内容, 整轮作废; 前三轮已经耗尽推理预算,
+    拿到合法 IR 时没有轮数再做 refine。只在闭合处后面紧跟逗号 (还有同级字段) 时去掉顶层
+    的那个闭合符, 至多去两处; 去完后整段必须是合法 JSON 对象。
+    """
+    for _ in range(_MAX_CLOSER_FIXES):
+        if not text[consumed:].lstrip().startswith(","):
+            return None
+        text = text[:consumed - 1] + text[consumed:]
+        try:
+            parsed, consumed = json.JSONDecoder().raw_decode(text, start)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        if not text[consumed:].strip("}] \t\r\n`"):
+            return parsed
+    return None
 
 
 def _json_context(text: str, position: int, width: int = 60) -> str:
