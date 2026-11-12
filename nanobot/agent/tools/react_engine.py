@@ -100,6 +100,9 @@ class DeepSeekClient:
         self.last_finish_reason: str | None = None
         # 最近一次调用的 usage; 推理模型在 completion_tokens_details 里给出思维链占了多少
         self.last_usage: dict[str, Any] | None = None
+        # 最近一次调用的思维链正文 (服务端返回 reasoning_content 时才有): 推理耗尽 max_tokens 时
+        # 正文是空的, 只能从这里看出模型把预算花在了哪里
+        self.last_reasoning: str | None = None
 
     @classmethod
     def from_env(cls, **overrides: Any) -> "DeepSeekClient":
@@ -148,6 +151,7 @@ class DeepSeekClient:
                 choice = body["choices"][0]
                 self.last_finish_reason = choice.get("finish_reason")
                 self.last_usage = body.get("usage")
+                self.last_reasoning = choice["message"].get("reasoning_content")
                 return choice["message"]["content"] or ""
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code if exc.response is not None else None
