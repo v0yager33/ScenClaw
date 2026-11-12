@@ -207,7 +207,7 @@ open("sead.txt", "w", encoding="utf-8").write(result["scenario_code"])
 |---|---|
 | 报“模型输出达到 max_tokens 上限被截断” | 平台多或使用推理模型时输出预算不够，调大 `--max-tokens`（16 个平台建议 32768） |
 | 请求超时 | 推理模型单次响应较慢，调大 `--timeout`（如 600） |
-| 推理模型花费高、常报“推理过程耗尽了 max_tokens” | 思维链和正文共用 `max_tokens`，按输出 token 计费。可用 `--reasoning-effort low`（或工具参数 `reasoning_effort`、环境变量 `DEEPSEEK_REASONING_EFFORT`）降低思考强度：实测 12v12 extract 在服务端默认强度下推理 46k–65k token，其中一半的运行首轮就耗尽 65536 的预算、白花一整次调用；同一份提示用 low 推理 34k、共 52k 写完合法 IR。不设置时，某次调用推理耗尽后的那一次重问也会自动改用 low |
+| 推理模型花费高、常报“推理过程耗尽了 max_tokens” | 思维链和正文共用 `max_tokens`，按输出 token 计费。最大的浪费是推理耗尽的调用：实测 12v12 extract 推理 46k–65k token，4 次运行里有 2 次首轮就耗尽 65536 的预算，每次白花一整次调用，整次运行的输出 token 从约 110k 涨到 270k–310k。现在某次调用推理耗尽后，那一次重问自动改用 `reasoning_effort=low`。整次运行都用 low（`--reasoning-effort low`、工具参数 `reasoning_effort` 或环境变量 `DEEPSEEK_REASONING_EFFORT`）实测没有明显省钱：输出 112k，默认强度为 105k–112k。非推理模式（`DEEPSEEK_MODEL=deepseek-chat`，即未设置时的默认值）输出只有 31k、耗时约 2 分钟，但 12v12 修完 4 轮仍剩 15 条问题、3 项外部检查不通过，只适合小想定或草稿 |
 | 返回“超出适用范围” | 需求命中非作战领域特征词，改写需求 |
 | “未能收敛成合法想定” | 查看打印的各轮错误，通常是缺少兵力构成、地理位置或时间窗，或用到了未放行的能力 |
 | 提示“请先设置 DEEPSEEK_API_KEY” | 未导出环境变量 |
