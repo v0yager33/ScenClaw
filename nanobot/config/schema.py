@@ -351,6 +351,13 @@ class ToolsConfig(Base):
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
 
 
+class TrajectoryConfig(Base):
+    """仅追加的本地 LLM/工具轨迹；空目录使用 workspace/trajectories。"""
+
+    enabled: bool = True
+    dir: Path | None = None
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
@@ -361,6 +368,7 @@ class Config(BaseSettings):
     api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    trajectory: TrajectoryConfig = Field(default_factory=TrajectoryConfig)
     model_presets: dict[str, ModelPresetConfig] = Field(
         default_factory=dict,
         validation_alias=AliasChoices("modelPresets", "model_presets"),

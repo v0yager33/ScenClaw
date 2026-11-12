@@ -387,6 +387,11 @@ class OpenAICompatProvider(LLMProvider):
         import httpx
 
         timeout_s = _openai_compat_timeout_s()
+        from nanobot.trajectory.core import get_recorder
+        from nanobot.trajectory.http import AsyncClient, sdk_http_client
+
+        recording = get_recorder().enabled
+        client_type = AsyncClient if recording else httpx.AsyncClient
         http_client: httpx.AsyncClient | None = None
         if self._is_local:
             # Local model servers (Ollama, llama.cpp, vLLM) often close idle
@@ -398,10 +403,12 @@ class OpenAICompatProvider(LLMProvider):
             # opening a fresh connection for each request, which is cheap on a
             # LAN. Cloud providers benefit from keepalive, so we leave the
             # default pool settings for them.
-            http_client = httpx.AsyncClient(
+            http_client = client_type(
                 limits=httpx.Limits(keepalive_expiry=0),
                 timeout=timeout_s,
             )
+        elif recording:
+            http_client = sdk_http_client(asynchronous=True, timeout=timeout_s)
         self._client = AsyncOpenAI(
             api_key=self._api_key_for_client,
             base_url=self._effective_base,

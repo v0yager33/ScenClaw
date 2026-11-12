@@ -94,6 +94,9 @@ nano.*.save
 # Logs & temp
 *.log
 logs/
+trajectories/
+trajectory-work/
+trajectory-export/
 tmp/
 temp/
 *.tmp

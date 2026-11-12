@@ -30,7 +30,9 @@ from typing import Any, Callable
 import httpx
 
 from nanobot.agent.tools.memory_store import MemoryStore
-
+from nanobot.trajectory.http import Client
+from nanobot.trajectory.instrumentation import run_scope
+from nanobot.trajectory.react import action_scope, record_tools
 
 # ═══════════════════════════════════════════════════════
 # 数据结构
@@ -117,6 +119,7 @@ class DeepSeekClient:
         """
         return cls(**overrides)
 
+    @run_scope("SynchronousLLM")
     def chat(self, messages: list[dict], temperature: float = 0.3,
              max_tokens: int = 2048, json_object: bool = False,
              reasoning_effort: str = "") -> str:
@@ -148,7 +151,7 @@ class DeepSeekClient:
         last_error: Exception | None = None
         for attempt in range(self.max_retries):
             try:
-                with httpx.Client(timeout=self.timeout) as client:
+                with Client(timeout=self.timeout) as client:
                     resp = client.post(url, headers=headers, json=payload)
                 if resp.status_code in self.RETRYABLE_STATUS:
                     raise httpx.HTTPStatusError(
@@ -242,7 +245,7 @@ Action Input: <JSON object>"""
         target_score: int = 85,
     ):
         self.llm = llm_client
-        self.tools = tools
+        self.tools = record_tools(tools)
         self.memory = memory
         self.max_steps = max_steps
         self.target_score = target_score
@@ -255,6 +258,7 @@ Action Input: <JSON object>"""
         self._current_issues: list[dict] = []
         self._context: dict = {}
 
+    @run_scope("ReActEngine")
     def run(self, task: str, context: dict) -> ReActResult:
         """执行 ReAct 循环。
 
@@ -426,6 +430,7 @@ Start by generating the AFSIM code."""
 
     # ── 动作执行 ──────────────────────────────────────────
 
+    @action_scope
     def _execute_action(self, action: str, action_input: dict, step: int) -> str:
         """执行动作，返回观察结果。"""
         try:

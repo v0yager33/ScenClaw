@@ -53,6 +53,11 @@ class AnthropicProvider(LLMProvider):
             client_kw["default_headers"] = extra_headers
         # Keep retries centralized in LLMProvider._run_with_retry to avoid retry amplification.
         client_kw["max_retries"] = 0
+        from nanobot.trajectory.core import get_recorder
+        from nanobot.trajectory.http import sdk_http_client
+
+        if get_recorder().enabled:
+            client_kw["http_client"] = sdk_http_client(asynchronous=True)
         self._client = AsyncAnthropic(**client_kw)
 
     @staticmethod

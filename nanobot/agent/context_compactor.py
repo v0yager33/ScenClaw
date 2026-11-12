@@ -34,6 +34,7 @@ import tiktoken
 from loguru import logger
 
 from nanobot.providers.base import LLMProvider
+from nanobot.trajectory.instrumentation import context_boundary
 from nanobot.utils.helpers import (
     ensure_dir,
     estimate_message_tokens,
@@ -213,6 +214,7 @@ class ContextCompactor:
         usage, self._usage = self._usage, {}
         return usage
 
+    @context_boundary
     async def maybe_compact(
         self,
         messages: list[dict[str, Any]],

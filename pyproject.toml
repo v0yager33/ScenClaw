@@ -133,6 +133,7 @@ allow-direct-references = true
 include = [
     "nanobot/**/*.py",
     "nanobot/templates/**/*.md",
+    "nanobot/templates/agent/trajectory_synthesis.txt",
     "nanobot/skills/**/*.md",
     "nanobot/skills/**/*.sh",
     "nanobot/web/dist/**/*",

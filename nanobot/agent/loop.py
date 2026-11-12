@@ -58,6 +58,7 @@ from nanobot.session.goal_state import (
 )
 from nanobot.session.keys import UNIFIED_SESSION_KEY, session_key_for_channel
 from nanobot.session.manager import Session, SessionManager
+from nanobot.trajectory.instrumentation import run_scope
 from nanobot.utils.document import extract_documents, reference_non_image_attachments
 from nanobot.utils.helpers import image_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
@@ -1240,6 +1241,7 @@ class AgentLoop:
             metadata=outbound_metadata,
         )
 
+    @run_scope("AgentLoop")
     async def _process_message(
         self,
         msg: InboundMessage,

@@ -9,6 +9,7 @@ from typing import Any
 from loguru import logger
 
 from nanobot.providers.base import LLMProvider, LLMResponse
+from nanobot.trajectory.instrumentation import run_scope
 
 # Circuit breaker tuned to match OpenAICompatProvider's Responses API breaker.
 _PRIMARY_FAILURE_THRESHOLD = 3
@@ -113,6 +114,7 @@ class FallbackProvider(LLMProvider):
             return True
         return False
 
+    @run_scope("ProviderFallback")
     async def chat(self, **kwargs: Any) -> LLMResponse:
         if not self._has_fallbacks:
             return await self._primary.chat(**kwargs)
@@ -120,6 +122,7 @@ class FallbackProvider(LLMProvider):
             lambda p, kw: p.chat(**kw), kwargs, has_streamed=None
         )
 
+    @run_scope("ProviderFallback")
     async def chat_stream(self, **kwargs: Any) -> LLMResponse:
         on_stream_recover = kwargs.pop("on_stream_recover", None)
         if not self._has_fallbacks:
@@ -283,6 +286,14 @@ class FallbackProvider(LLMProvider):
             content=f"Primary model '{primary_model}' circuit open and no fallbacks available",
             finish_reason="error",
         )
+
+    @run_scope("ProviderRetry")
+    async def chat_with_retry(self, *args, **kwargs):
+        return await super().chat_with_retry(*args, **kwargs)
+
+    @run_scope("ProviderRetry")
+    async def chat_stream_with_retry(self, *args, **kwargs):
+        return await super().chat_stream_with_retry(*args, **kwargs)
 
     @staticmethod
     def _should_fallback(response: LLMResponse) -> bool:

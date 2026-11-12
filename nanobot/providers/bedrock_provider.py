@@ -682,7 +682,11 @@ class BedrockProvider(LLMProvider):
             kwargs = self._build_kwargs(
                 messages, tools, model, max_tokens, temperature, reasoning_effort, tool_choice
             )
+            from nanobot.trajectory.core import capture_native, emit
+
+            emit("sdk_start", {"request": kwargs, "capture_level": "sdk"})
             response = await asyncio.to_thread(self._client.converse, **kwargs)
+            capture_native(response)
             return self._parse_response(response)
         except Exception as e:
             return self._handle_error(e)
@@ -712,6 +716,11 @@ class BedrockProvider(LLMProvider):
             kwargs = self._build_kwargs(
                 messages, tools, model, max_tokens, temperature, reasoning_effort, tool_choice
             )
+            from nanobot.trajectory.core import capture_native, emit
+            from nanobot.trajectory.stream import SafeFrames
+
+            emit("sdk_start", {"request": kwargs, "capture_level": "sdk"})
+            safe = SafeFrames(lambda frame: capture_native(frame, streaming=True))
             response = await asyncio.to_thread(self._client.converse_stream, **kwargs)
             stream = iter(response.get("stream") or [])
             while True:
@@ -721,6 +730,7 @@ class BedrockProvider(LLMProvider):
                 )
                 if event is None:
                     break
+                safe.push(event)
                 delta = self._parse_stream_event(
                     event,
                     content_parts=content_parts,
@@ -749,6 +759,9 @@ class BedrockProvider(LLMProvider):
             )
         except Exception as e:
             return self._handle_error(e)
+        finally:
+            if "safe" in locals():
+                safe.drain(True)
 
     def get_default_model(self) -> str:
         return self.default_model

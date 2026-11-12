@@ -200,7 +200,9 @@ async def _request_codex(
     on_tool_call_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> tuple[str, list[ToolCallRequest], str, dict[str, int], str | None]:
     idle_timeout_s = int(os.environ.get("NANOBOT_STREAM_IDLE_TIMEOUT_S", "90"))
-    async with httpx.AsyncClient(timeout=idle_timeout_s, verify=verify) as client:
+    from nanobot.trajectory.http import AsyncClient
+
+    async with AsyncClient(timeout=idle_timeout_s, verify=verify) as client:
         async with client.stream("POST", url, headers=headers, json=body) as response:
             if response.status_code != 200:
                 text = await response.aread()

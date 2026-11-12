@@ -120,7 +120,11 @@ class AzureOpenAIProvider(LLMProvider):
 
         # SDK client targeting the Azure Responses API endpoint
         base_url = f"{api_base.rstrip('/')}/openai/v1/"
+        from nanobot.trajectory.core import get_recorder
+        from nanobot.trajectory.http import sdk_http_client
+
         self._client = AsyncOpenAI(
+            http_client=sdk_http_client(asynchronous=True) if get_recorder().enabled else None,
             api_key=client_api_key,
             base_url=base_url,
             default_headers={"x-session-affinity": uuid.uuid4().hex},

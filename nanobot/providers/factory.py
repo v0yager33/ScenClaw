@@ -36,6 +36,10 @@ def _make_provider_core(
     model: str | None = None,
 ) -> LLMProvider:
     """Create a plain LLM provider without failover wrapping."""
+    from nanobot.trajectory import configure_default
+    from nanobot.trajectory.provider import RecordingProvider
+
+    recorder = configure_default(config)
     resolved = _resolve_model_preset(config, preset_name=preset_name, preset=preset)
     model = model or resolved.model
     provider_name = config.get_provider_name(model, preset=resolved)
@@ -117,7 +121,11 @@ def _make_provider_core(
         )
 
     provider.generation = resolved.to_generation_settings()
-    return provider
+    if p:
+        recorder.add_secret(p.api_key)
+        for value in (p.extra_headers or {}).values():
+            recorder.add_secret(value)
+    return RecordingProvider(provider, provider_name or backend)
 
 
 def _inline_fallback_preset(

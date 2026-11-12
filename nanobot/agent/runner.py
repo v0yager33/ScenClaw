@@ -17,6 +17,8 @@ from nanobot.agent.context_compactor import ContextCompactor
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from nanobot.trajectory.core import emit
+from nanobot.trajectory.instrumentation import run_scope, tool_scope
 from nanobot.utils.file_edit_events import (
     StreamingFileEditTracker,
     build_file_edit_end_event,
@@ -277,6 +279,7 @@ class AgentRunner:
             injected_messages = injected_messages[:_MAX_INJECTIONS_PER_TURN]
         return injected_messages
 
+    @run_scope("AgentRunner")
     async def run(self, spec: AgentRunSpec) -> AgentRunResult:
         hook = spec.hook or AgentHook()
         messages = list(spec.initial_messages)
@@ -455,6 +458,7 @@ class AgentRunner:
                             result,
                         ),
                     }
+                    emit("tool_visible", {"message": tool_message}, tool_call_id=tool_call.id)
                     messages.append(tool_message)
                     completed_tool_results.append(tool_message)
                 if fatal_error is not None:
@@ -1043,6 +1047,7 @@ class AgentRunner:
                 fatal_error = error
         return results, events, fatal_error
 
+    @tool_scope
     async def _run_tool(
         self,
         spec: AgentRunSpec,
@@ -1114,11 +1119,13 @@ class AgentRunner:
                     params if isinstance(params, dict) else None,
                 ) for file_edit_tracker in file_edit_trackers],
             )
+        emit("tool_prepared", {"name": tool_call.name, "arguments": params})
         try:
             if tool is not None:
                 result = await tool.execute(**params)
             else:
                 result = await spec.tools.execute(tool_call.name, params)
+            emit("tool_result", {"name": tool_call.name, "result": result})
         except asyncio.CancelledError:
             raise
         except BaseException as exc:

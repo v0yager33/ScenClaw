@@ -1,7 +1,15 @@
 from unittest.mock import patch, sentinel
 
+import pytest
 from nanobot.providers.openai_compat_provider import OpenAICompatProvider
 from nanobot.providers.registry import ProviderSpec
+from nanobot.trajectory import core
+
+
+@pytest.fixture(autouse=True)
+def disabled_trajectory(tmp_path, monkeypatch):
+    # 原客户端分支在关闭采集时保持不变；开启分支另有集成回归。
+    monkeypatch.setattr(core, "_RECORDER", core.Recorder("test", tmp_path / "capture", False))
 
 
 def _assert_openai_compat_timeout(timeout) -> None:

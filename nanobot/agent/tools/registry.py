@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from nanobot.agent.tools.base import Tool
+from nanobot.trajectory.instrumentation import tool_scope
 
 
 class ToolRegistry:
@@ -154,6 +155,7 @@ class ToolRegistry:
             return params
         return cls._coerce_argument_value(params.get("arguments"))
 
+    @tool_scope
     async def execute(self, name: str, params: Any) -> Any:
         """Execute a tool by name with given parameters."""
         hint = "\n\n[Analyze the error above and try a different approach.]"
