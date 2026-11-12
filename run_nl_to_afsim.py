@@ -45,6 +45,8 @@ async def main() -> int:
     parser.add_argument("--max-tokens", type=int, default=8192,
                         help="单次 LLM 调用的输出预算 (含推理模型思维链); 平台多时调大")
     parser.add_argument("--timeout", type=int, default=120, help="单次 LLM 调用超时(秒)")
+    parser.add_argument("--reasoning-effort", default="",
+                        help="推理模型的思考强度 (如 low / high); 默认读 DEEPSEEK_REASONING_EFFORT 或用服务端默认")
     args = parser.parse_args()
 
     if not os.environ.get("DEEPSEEK_API_KEY"):
@@ -66,6 +68,8 @@ async def main() -> int:
     }
     if args.scenario_id:
         kwargs["scenario_id"] = args.scenario_id
+    if args.reasoning_effort:
+        kwargs["reasoning_effort"] = args.reasoning_effort
 
     raw = await NLToAfsimTool().execute(**kwargs)
     if not raw.lstrip().startswith("{"):

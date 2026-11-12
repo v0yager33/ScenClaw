@@ -16,6 +16,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from pydantic import ValidationError
 
@@ -729,10 +730,12 @@ class FinishReasonLLM(ScriptedLLM):
         self.usages = usages or [None] * len(responses)
         self.last_finish_reason: str | None = None
         self.last_usage: dict | None = None
+        self.call_kwargs: list[dict[str, Any]] = []
 
     def chat(self, messages: list[dict], **kwargs: Any) -> str:
         self.last_finish_reason = self.reasons[len(self.calls)]
         self.last_usage = self.usages[len(self.calls)]
+        self.call_kwargs.append(kwargs)
         return super().chat(messages, **kwargs)
 
 
@@ -1544,6 +1547,58 @@ def test_revision_thought_out_retry_does_not_use_up_a_repair_round() -> None:
 
     assert result.success and result.advisories == []
     assert [a.stage for a in result.attempts] == ["extract", "refine", "refine"]
+
+
+def test_thought_out_retry_lowers_reasoning_effort_for_that_call_only() -> None:
+    """rerun 实测: extract 连续三次推理耗尽, 光靠催促压不住; 同一份提示用 low 重放就写完了。"""
+    llm = FinishReasonLLM(
+        [(_PARTIAL_REPLY, "length"), (_dumps(_overlapping_ir()), "stop"),
+         (_patch(_restore_red_radar()), "stop")],
+        usages=[_THOUGHT_OUT_USAGE, None, None],
+    )
+    result = ScenarioIRPlanner(llm=llm, max_repair_rounds=2).plan("任务")
+
+    assert result.success and result.advisories == []
+    assert [kwargs.get("reasoning_effort") for kwargs in llm.call_kwargs] == [None, "low", None]
+
+
+def test_thought_out_retry_keeps_effort_unset_without_reasoning_usage() -> None:
+    """服务端没报思维链用量 (非推理模型或别家兼容服务) 时不传 reasoning_effort, 免得被拒。"""
+    llm = FinishReasonLLM([("", "length"), (_dumps(_valid_ir()), "stop")])
+
+    assert ScenarioIRPlanner(llm=llm).plan("任务").success
+    assert all("reasoning_effort" not in kwargs for kwargs in llm.call_kwargs)
+
+
+def test_deepseek_client_sends_reasoning_effort_only_when_set(monkeypatch) -> None:
+    from nanobot.agent.tools import react_engine
+
+    sent: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}]}
+        )
+
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        react_engine.httpx, "Client",
+        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),
+    )
+    messages = [{"role": "user", "content": "hi"}]
+    monkeypatch.delenv("DEEPSEEK_REASONING_EFFORT", raising=False)
+    client = react_engine.DeepSeekClient(api_key="test-key")
+    client.chat(messages)
+    client.chat(messages, reasoning_effort="low")
+    monkeypatch.setenv("DEEPSEEK_REASONING_EFFORT", "high")
+    env_client = react_engine.DeepSeekClient(api_key="test-key")
+    env_client.chat(messages)
+    env_client.chat(messages, reasoning_effort="low")
+
+    assert [body.get("reasoning_effort") for body in sent] == [None, "low", "high", "low"]
+    # 工具参数一路透传到客户端
+    assert planner_module._make_llm({"api_key": "k", "reasoning_effort": "low"}).reasoning_effort == "low"
 
 
 def test_thought_out_refine_retry_lists_fewer_issues(monkeypatch) -> None:

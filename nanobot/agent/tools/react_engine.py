@@ -74,6 +74,7 @@ class DeepSeekClient:
     ENV_API_KEY = "DEEPSEEK_API_KEY"
     ENV_BASE_URL = "DEEPSEEK_BASE_URL"
     ENV_MODEL = "DEEPSEEK_MODEL"
+    ENV_REASONING_EFFORT = "DEEPSEEK_REASONING_EFFORT"
 
     DEFAULT_BASE_URL = "https://api.deepseek.com"
     DEFAULT_MODEL = "deepseek-chat"
@@ -83,7 +84,8 @@ class DeepSeekClient:
 
     def __init__(self, api_key: str = "", base_url: str = "",
                  model: str = "", timeout: int = 120,
-                 max_retries: int = 3, retry_backoff_s: float = 2.0):
+                 max_retries: int = 3, retry_backoff_s: float = 2.0,
+                 reasoning_effort: str = ""):
         self.api_key = api_key or os.environ.get(self.ENV_API_KEY, "")
         if not self.api_key:
             raise ValueError(
@@ -92,6 +94,8 @@ class DeepSeekClient:
         base = base_url or os.environ.get(self.ENV_BASE_URL) or self.DEFAULT_BASE_URL
         self.base_url = base.rstrip("/")
         self.model = model or os.environ.get(self.ENV_MODEL) or self.DEFAULT_MODEL
+        # 推理模型的思考强度 (如 low / high, 取值由服务端校验); 空串表示不传, 用服务端默认
+        self.reasoning_effort = reasoning_effort or os.environ.get(self.ENV_REASONING_EFFORT, "")
         self.timeout = timeout
         self.max_retries = max(1, max_retries)
         self.retry_backoff_s = retry_backoff_s
@@ -114,12 +118,14 @@ class DeepSeekClient:
         return cls(**overrides)
 
     def chat(self, messages: list[dict], temperature: float = 0.3,
-             max_tokens: int = 2048, json_object: bool = False) -> str:
+             max_tokens: int = 2048, json_object: bool = False,
+             reasoning_effort: str = "") -> str:
         """调用 chat completions API，返回助手回复文本。
 
         Args:
             json_object: 打开服务端 JSON 模式, 强制返回可解析的 JSON 对象。
                 用于结构化抽取 (自然语言 → ScenarioIR), 免得再去正则抠代码块。
+            reasoning_effort: 只对这一次调用生效的思考强度, 覆盖构造时的设置。
         """
         url = f"{self.base_url}/v1/chat/completions"
         headers = {
@@ -135,6 +141,9 @@ class DeepSeekClient:
         }
         if json_object:
             payload["response_format"] = {"type": "json_object"}
+        effort = reasoning_effort or self.reasoning_effort
+        if effort:
+            payload["reasoning_effort"] = effort
 
         last_error: Exception | None = None
         for attempt in range(self.max_retries):

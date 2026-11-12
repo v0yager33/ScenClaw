@@ -258,6 +258,10 @@ _THOUGHT_OUT_NUDGE = (
     "直接输出完整的 ScenarioIR JSON; 交战时序、几何可达性等问题之后会由校验器逐条指出。"
 )
 
+# 推理耗尽后那次重问的思考强度: 光靠催促压不住推演, 实测 12v12 extract 连续三次各烧掉 65536 token
+# 只得到被截断的正文; 同一份提示用 low 重放, 推理 34k、共 52k 就写完了合法 IR
+_THOUGHT_OUT_EFFORT = "low"
+
 # 需求核对轮: 模型确认需求都已满足时只回这个标记, 不必把整份 IR 再抄一遍
 _REQUIREMENTS_MET_SENTINEL = "__requirements_met__"
 
@@ -1358,17 +1362,14 @@ class ScenarioIRPlanner:
         # 修订轮推理耗尽过一次, 之后的 refine 都只列前几条: 实测重问时列 12 条修成了,
         # 下一轮又把 30 条问题全列出来, 再次耗尽推理预算, 带着 30 条问题收场
         refine_limit = _REFINE_LIMIT
+        # 下一次调用的思考强度; 空串表示按客户端自己的设置
+        next_effort = ""
         round_index = 0
 
         while round_index < round_budget:
             round_index += 1
             try:
-                raw = self.llm.chat(
-                    conversation,
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                    json_object=True,
-                )
+                raw = self._chat(conversation, reasoning_effort=next_effort)
             except Exception as exc:
                 if best is None:
                     raise
@@ -1377,6 +1378,7 @@ class ScenarioIRPlanner:
                     round_index, stage, False, [f"模型调用失败: {type(exc).__name__}: {exc}"[:400]],
                 ))
                 break
+            next_effort = ""
             # 只在模型正常收尾时补漏写的闭合符: 截断的半截补丁补齐后会被当成完整补丁合并
             finished = getattr(self.llm, "last_finish_reason", None) == "stop"
             payload, parse_errors = _parse_json_object(raw, close_unbalanced=finished)
@@ -1427,6 +1429,8 @@ class ScenarioIRPlanner:
                 # 还没有合法 IR 时每轮都值得再试; 已有合法结果时只催一次, 不为 refine 反复烧预算
                 if worth_retry and (best is None or not refine_nudged):
                     refine_nudged = best is not None
+                    if thought_out and self._reasoning_reported():
+                        next_effort = _THOUGHT_OUT_EFFORT
                     if stage == "refine":
                         refine_limit = _NARROWED_REFINE_LIMIT
                     if best is None and stage == "extract" and not extract_retried:
@@ -1619,6 +1623,21 @@ class ScenarioIRPlanner:
             return best
         return PlanResult(success=False, attempts=attempts, capability_gaps=gaps)
 
+    def _chat(self, messages: list[dict[str, str]], reasoning_effort: str = "") -> str:
+        kwargs: dict[str, Any] = {
+            "temperature": self.temperature, "max_tokens": self.max_tokens, "json_object": True,
+        }
+        # 只在要压低思考强度时才传, 不认识这个参数的客户端照常可用
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
+        return self.llm.chat(messages, **kwargs)
+
+    def _reasoning_reported(self) -> bool:
+        """服务端报了思维链用量, 说明是推理模型, 可以按思考强度调。"""
+        usage = getattr(self.llm, "last_usage", None)
+        details = usage.get("completion_tokens_details") if isinstance(usage, dict) else None
+        return bool(isinstance(details, dict) and details.get("reasoning_tokens"))
+
     def _reasoning_exhausted(self, raw: str) -> bool:
         """截断是因为推演吃掉了预算, 而不是 IR 本身太长。"""
         if not raw.strip():
@@ -1650,12 +1669,7 @@ class ScenarioIRPlanner:
                 f"=== 规划正文 ===\n{request.strip()}\n\n=== 平台清单 ===\n{roster}"},
         ]
         try:
-            raw = self.llm.chat(
-                messages,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                json_object=True,
-            )
+            raw = self._chat(messages)
         except Exception as exc:
             return [], [f"条款抽取调用失败, 本次不核验需求条款: {type(exc).__name__}: {exc}"[:300]]
         finished = getattr(self.llm, "last_finish_reason", None) == "stop"
@@ -2336,6 +2350,7 @@ def _make_llm(kwargs: dict[str, Any]) -> Any:
         base_url=kwargs.get("base_url", ""),
         model=kwargs.get("model", ""),
         timeout=int(kwargs.get("timeout_s") or 120),
+        reasoning_effort=kwargs.get("reasoning_effort", ""),
     )
 
 
@@ -2367,6 +2382,14 @@ _LLM_PARAMS: dict[str, Any] = {
         "type": "integer",
         "description": "HTTP timeout per LLM call in seconds. Default: 120",
         "minimum": 10,
+    },
+    "reasoning_effort": {
+        "type": "string",
+        "description": (
+            "Thinking effort for reasoning models (e.g. low / high; the server validates it). "
+            "Defaults to DEEPSEEK_REASONING_EFFORT or the server default. A retry after a call "
+            "spent its whole budget on reasoning always uses low."
+        ),
     },
 }
 

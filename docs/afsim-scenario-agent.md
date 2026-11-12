@@ -207,6 +207,7 @@ open("sead.txt", "w", encoding="utf-8").write(result["scenario_code"])
 |---|---|
 | 报“模型输出达到 max_tokens 上限被截断” | 平台多或使用推理模型时输出预算不够，调大 `--max-tokens`（16 个平台建议 32768） |
 | 请求超时 | 推理模型单次响应较慢，调大 `--timeout`（如 600） |
+| 推理模型花费高、常报“推理过程耗尽了 max_tokens” | 思维链和正文共用 `max_tokens`，按输出 token 计费。可用 `--reasoning-effort low`（或工具参数 `reasoning_effort`、环境变量 `DEEPSEEK_REASONING_EFFORT`）降低思考强度：实测 12v12 extract 在服务端默认强度下推理 46k–65k token，其中一半的运行首轮就耗尽 65536 的预算、白花一整次调用；同一份提示用 low 推理 34k、共 52k 写完合法 IR。不设置时，某次调用推理耗尽后的那一次重问也会自动改用 low |
 | 返回“超出适用范围” | 需求命中非作战领域特征词，改写需求 |
 | “未能收敛成合法想定” | 查看打印的各轮错误，通常是缺少兵力构成、地理位置或时间窗，或用到了未放行的能力 |
 | 提示“请先设置 DEEPSEEK_API_KEY” | 未导出环境变量 |
