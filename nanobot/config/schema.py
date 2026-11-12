@@ -166,6 +166,12 @@ class AgentDefaults(Base):
         validation_alias=AliasChoices("consolidationRatio"),
         serialization_alias="consolidationRatio",
     )  # Consolidation target ratio (0.5 = 50% of budget retained after compression)
+    context_compaction: bool = True  # Summarize the older part of a long run when its prompt nears the context budget
+    context_compaction_ratio: float = Field(
+        default=0.8,
+        ge=0.3,
+        le=0.95,
+    )  # Share of the prompt budget at which in-run compaction starts
     dream: DreamConfig = Field(default_factory=DreamConfig)
 
 

@@ -13,6 +13,7 @@ from typing import Any, Callable
 
 from loguru import logger
 
+from nanobot.agent.context_compactor import ContextCompactor
 from nanobot.agent.hook import AgentHook, AgentHookContext, AgentRunHookContext
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
@@ -111,6 +112,10 @@ class AgentRunSpec:
     goal_active_predicate: Callable[[], bool] | None = None
     goal_continue_message: str | None = None
     finalize_on_max_iterations: bool = True
+    # Summarize the older part of the run once the prompt passes this share of
+    # the context budget (see ContextCompactor). Needs context_window_tokens.
+    context_compaction: bool = False
+    context_compaction_ratio: float = 0.8
 
 
 @dataclass(slots=True)
@@ -339,14 +344,22 @@ class AgentRunner:
         length_recovery_count = 0
         had_injections = False
         injection_cycles = 0
+        compactor = self._make_compactor(spec)
 
         for iteration in range(spec.max_iterations):
+            source = messages
             try:
                 # Keep the persisted conversation untouched. Context governance
                 # may repair or compact historical messages for the model, but
                 # those synthetic edits must not shift the append boundary used
                 # later when the caller saves only the new turn.
-                messages_for_model = self._drop_orphan_tool_results(messages)
+                if compactor is not None:
+                    source = await compactor.maybe_compact(
+                        messages,
+                        lambda view: self._estimate_prompt(spec, self._microcompact(view)),
+                    )
+                    self._accumulate_usage(usage, compactor.take_usage())
+                messages_for_model = self._drop_orphan_tool_results(source)
                 messages_for_model = self._backfill_missing_tool_results(messages_for_model)
                 messages_for_model = self._microcompact(messages_for_model)
                 messages_for_model = self._apply_tool_result_budget(spec, messages_for_model)
@@ -361,10 +374,10 @@ class AgentRunner:
                     spec.session_key or "default",
                 )
                 try:
-                    messages_for_model = self._drop_orphan_tool_results(messages)
+                    messages_for_model = self._drop_orphan_tool_results(source)
                     messages_for_model = self._backfill_missing_tool_results(messages_for_model)
                 except Exception:
-                    messages_for_model = messages
+                    messages_for_model = source
             context = AgentHookContext(
                 iteration=iteration,
                 messages=messages,
@@ -651,6 +664,7 @@ class AgentRunner:
                     hook,
                     messages,
                     usage,
+                    model_messages=compactor.view(messages) if compactor is not None else None,
                 )
             if final_content is None:
                 final_content = self._max_iterations_fallback(spec)
@@ -851,8 +865,12 @@ class AgentRunner:
         hook: AgentHook,
         messages: list[dict[str, Any]],
         usage: dict[str, int],
+        *,
+        model_messages: list[dict[str, Any]] | None = None,
     ) -> str | None:
-        retry_messages = self._budget_exhausted_finalization_messages(messages)
+        retry_messages = self._budget_exhausted_finalization_messages(
+            model_messages if model_messages is not None else messages
+        )
         try:
             response = await self._request_no_tools(spec, retry_messages)
         except Exception:
@@ -1442,14 +1460,10 @@ class AgentRunner:
                 updated[idx]["content"] = normalized
         return updated
 
-    def _snip_history(
-        self,
-        spec: AgentRunSpec,
-        messages: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        if not messages or not spec.context_window_tokens:
-            return messages
-
+    def _context_budget(self, spec: AgentRunSpec) -> int | None:
+        """Prompt token budget: the context window minus output and a safety buffer."""
+        if not spec.context_window_tokens:
+            return None
         provider_max_tokens = getattr(getattr(self.provider, "generation", None), "max_tokens", 4096)
         max_output = spec.max_tokens if isinstance(spec.max_tokens, int) else (
             provider_max_tokens if isinstance(provider_max_tokens, int) else 4096
@@ -1457,15 +1471,45 @@ class AgentRunner:
         budget = spec.context_block_limit or (
             spec.context_window_tokens - max_output - _SNIP_SAFETY_BUFFER
         )
-        if budget <= 0:
-            return messages
+        return budget if budget > 0 else None
 
+    def _estimate_prompt(self, spec: AgentRunSpec, messages: list[dict[str, Any]]) -> int:
         estimate, _ = estimate_prompt_tokens_chain(
             self.provider,
             spec.model,
             messages,
             spec.tools.get_definitions(),
         )
+        return estimate
+
+    def _make_compactor(self, spec: AgentRunSpec) -> ContextCompactor | None:
+        if not spec.context_compaction:
+            return None
+        budget = self._context_budget(spec)
+        if budget is None:
+            return None
+        return ContextCompactor(
+            self.provider,
+            spec.model,
+            budget=budget,
+            trigger_ratio=spec.context_compaction_ratio,
+            workspace=spec.workspace,
+            session_key=spec.session_key,
+            retry_mode=spec.provider_retry_mode,
+        )
+
+    def _snip_history(
+        self,
+        spec: AgentRunSpec,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not messages:
+            return messages
+        budget = self._context_budget(spec)
+        if budget is None:
+            return messages
+
+        estimate = self._estimate_prompt(spec, messages)
         if estimate <= budget:
             return messages
 

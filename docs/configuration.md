@@ -1882,6 +1882,37 @@ How it works:
 >
 > This differs from the **token-driven soft consolidation** that fires when a prompt exceeds the context budget: that path only advances an internal `last_consolidated` cursor and leaves the session file untouched, so the raw tool-call trail stays on disk and can still be replayed or audited. If you rely on that trail for debugging or auditing, leave `idleCompactAfterMinutes` at the default `0` and let only the token-driven path run.
 
+## In-run Context Compaction
+
+Consolidation and auto compact cut the session at user-turn boundaries, so they cannot shrink a single long turn: one request followed by hundreds of tool calls has nowhere to cut, and the prompt keeps growing until the provider rejects it. In-run compaction handles that case inside the agent loop, for the main agent and for subagents.
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "contextCompaction": true,
+      "contextCompactionRatio": 0.8
+    }
+  }
+}
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `agents.defaults.contextCompaction` | `true` | Summarize the older part of a run when its prompt nears the context budget. |
+| `agents.defaults.contextCompactionRatio` | `0.8` | Share of the prompt budget at which compaction starts (`0.3`–`0.95`). |
+
+The prompt budget is `contextBlockLimit` when set, otherwise `contextWindowTokens` minus the completion budget (`maxTokens`) and a 1024-token safety margin.
+
+How it works:
+1. **Trigger**: Before each model call, the runner estimates the prompt. Below `contextCompactionRatio` × budget nothing happens.
+2. **Cut**: Messages after the system prompt are split into an older segment and a recent tail of about 30% of the budget. The tail never starts with a tool result, so every tool call in it keeps its result.
+3. **Transcript**: The older segment is appended verbatim to `<workspace>/.nanobot/transcripts/<session>/<run>.jsonl`.
+4. **Summary**: The model writes a structured summary of the segment (requests and intent, key concepts, files and code, errors and fixes, problem solving, user messages, pending tasks, current work, next step). A later compaction in the same run merges the previous summary with the newly folded messages.
+5. **Notice**: The segment is replaced by one user message holding the summary, the transcript path, the files named in tool arguments, and the user messages copied verbatim (long ones clipped). The agent is told the summary is lossy and can `grep` or `read_file` the transcript for details.
+
+If the summary call fails, a mechanical digest (assistant notes and the list of tool calls) is used instead, so a provider error never stops the run. Compaction only changes the prompt sent to the model; the run's own message list, which is saved to the session as usual, is not modified. Set `contextCompaction` to `false` to fall back to snipping alone, which keeps an oversized single turn intact.
+
 ## Timezone
 
 Time is context. Context should be precise.

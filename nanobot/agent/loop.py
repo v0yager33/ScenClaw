@@ -201,6 +201,8 @@ class AgentLoop:
         session_ttl_minutes: int = 0,
         consolidation_ratio: float = 0.5,
         max_messages: int = 120,
+        context_compaction: bool = True,
+        context_compaction_ratio: float = 0.8,
         hooks: list[AgentHook] | None = None,
         unified_session: bool = False,
         disabled_skills: list[str] | None = None,
@@ -240,6 +242,8 @@ class AgentLoop:
             else defaults.context_window_tokens
         )
         self.context_block_limit = context_block_limit
+        self.context_compaction = context_compaction
+        self.context_compaction_ratio = context_compaction_ratio
         self.max_tool_result_chars = (
             max_tool_result_chars
             if max_tool_result_chars is not None
@@ -287,6 +291,9 @@ class AgentLoop:
             disabled_skills=disabled_skills,
             max_iterations=self.max_iterations,
             max_concurrent_subagents=max_concurrent_subagents,
+            context_window_tokens=self.context_window_tokens,
+            context_compaction=context_compaction,
+            context_compaction_ratio=context_compaction_ratio,
             llm_wall_timeout_for_session=lambda sk: runner_wall_llm_timeout_s(self.sessions, sk),
         )
         self._unified_session = unified_session
@@ -388,6 +395,8 @@ class AgentLoop:
             session_ttl_minutes=defaults.session_ttl_minutes,
             consolidation_ratio=defaults.consolidation_ratio,
             max_messages=defaults.max_messages,
+            context_compaction=defaults.context_compaction,
+            context_compaction_ratio=defaults.context_compaction_ratio,
             tools_config=config.tools,
             model_presets=preset_helpers.configured_model_presets(config),
             model_preset=defaults.model_preset,
@@ -399,6 +408,7 @@ class AgentLoop:
     def _sync_subagent_runtime_limits(self) -> None:
         """Keep subagent runtime limits aligned with mutable loop settings."""
         self.subagents.max_iterations = self.max_iterations
+        self.subagents.context_window_tokens = self.context_window_tokens
 
     def _apply_provider_snapshot(
         self,
@@ -417,6 +427,7 @@ class AgentLoop:
         self.context_window_tokens = context_window_tokens
         self.runner.provider = provider
         self.subagents.set_provider(provider, model)
+        self.subagents.context_window_tokens = context_window_tokens
         self.consolidator.set_provider(provider, model, context_window_tokens)
         self._provider_signature = snapshot.signature
         if publish_update and self._runtime_model_publisher is not None:
@@ -820,6 +831,8 @@ class AgentLoop:
                 session_key=session.key if session else None,
                 context_window_tokens=self.context_window_tokens,
                 context_block_limit=self.context_block_limit,
+                context_compaction=self.context_compaction,
+                context_compaction_ratio=self.context_compaction_ratio,
                 provider_retry_mode=self.provider_retry_mode,
                 progress_callback=on_progress,
                 stream_progress_deltas=on_stream is not None,

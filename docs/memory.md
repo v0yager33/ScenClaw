@@ -43,6 +43,8 @@ Each line is a JSON object:
 
 It is not the final memory. It is the material from which final memory is shaped.
 
+The Consolidator works between user turns. A single long turn, with many tool calls and no user boundary to cut at, is handled inside the run by [in-run context compaction](./configuration.md#in-run-context-compaction): the older part of the run is summarized for the model and kept verbatim in `.nanobot/transcripts/`, while the session itself is left untouched.
+
 ### Stage 2: Dream
 
 `Dream` is the slower, more thoughtful layer. It runs on a cron schedule by default and can also be triggered manually.

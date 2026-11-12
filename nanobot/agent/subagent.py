@@ -86,6 +86,9 @@ class SubagentManager:
         disabled_skills: list[str] | None = None,
         max_iterations: int | None = None,
         max_concurrent_subagents: int | None = None,
+        context_window_tokens: int | None = None,
+        context_compaction: bool = True,
+        context_compaction_ratio: float = 0.8,
         llm_wall_timeout_for_session: Callable[[str | None], float | None] | None = None,
     ):
         defaults = AgentDefaults()
@@ -107,6 +110,10 @@ class SubagentManager:
             if max_concurrent_subagents is not None
             else defaults.max_concurrent_subagents
         )
+        # Without a context window the runner neither snips nor compacts.
+        self.context_window_tokens = context_window_tokens
+        self.context_compaction = context_compaction
+        self.context_compaction_ratio = context_compaction_ratio
         self.runner = AgentRunner(provider)
         self._llm_wall_timeout_for_session = llm_wall_timeout_for_session
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
@@ -255,6 +262,9 @@ class SubagentManager:
                     session_key=sess_key,
                     workspace=root,
                     llm_timeout_s=llm_timeout,
+                    context_window_tokens=self.context_window_tokens,
+                    context_compaction=self.context_compaction,
+                    context_compaction_ratio=self.context_compaction_ratio,
                 ))
             finally:
                 if token is not None:
