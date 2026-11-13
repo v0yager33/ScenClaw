@@ -1,4 +1,4 @@
-"""Deterministic ScenarioIR-to-AFSIM compiler."""
+"""AFSIM 想定编译器（AFSIM Scenario Compiler）— ScenarioIR → AFSIM 文本。"""
 
 from __future__ import annotations
 
@@ -119,7 +119,7 @@ def _platform_types(scenario: ScenarioIR) -> dict[str, tuple[str, str | None]]:
 
 
 class AfsimCompiler:
-    """Compile the deliberately small, validated MVP subset of ScenarioIR."""
+    """AFSIM 想定编译器：编译经过校验的 ScenarioIR MVP 子集。"""
 
     def __init__(
         self,

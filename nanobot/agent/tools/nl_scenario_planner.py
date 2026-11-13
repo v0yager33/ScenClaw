@@ -329,10 +329,10 @@ def _build_system_prompt(registry: CapabilityRegistry) -> str:
     sentinel = _OUT_OF_SCOPE_SENTINEL
     engagement_rules = _IMPLICIT_ENGAGEMENT_RULES if "WSF_IMPLICIT_WEAPON" in weapons else ""
 
-    return f"""你是 AFSIM 想定构建器的语义抽取前端。任务: 把用户的自然语言作战规划
+    return f"""你是 AFSIM 想定生成链路的语义抽取前端。任务: 把用户的自然语言作战规划
 转成一份严格符合 ScenarioIR schema 的 JSON。
 
-你只负责语义抽取, 不要输出任何 AFSIM 语法 —— AFSIM 文本由下游确定性编译器渲染。
+你只负责语义抽取, 不要输出任何 AFSIM 语法 —— AFSIM 文本由下游 AFSIM 想定编译器渲染。
 
 ScenarioIR 结构 (注释仅供理解, 输出时不要带注释):
 {_IR_SHAPE}
@@ -2544,7 +2544,7 @@ class NLScenarioPlanTool(Tool):
 
 
 class ScenarioCompileTool(Tool):
-    """ScenarioIR → AFSIM 文本 (确定性, 不调用大模型)。"""
+    """AFSIM 想定编译器工具：ScenarioIR → AFSIM 文本，不调用大模型。"""
 
     _scopes = {"core", "subagent"}
 
@@ -2555,10 +2555,9 @@ class ScenarioCompileTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Deterministically compile a ScenarioIR JSON document into AFSIM 2.9 "
-            "scenario text. No LLM involved: the same IR always yields byte-identical "
-            "output. Runs the capability whitelist, the AFSIM static linter and the "
-            "four-level scenario validator, and can write the result to a file."
+            "AFSIM 想定编译器（AFSIM Scenario Compiler）：将 ScenarioIR JSON "
+            "编译为 AFSIM 2.9 想定文本。编译过程不调用大模型，同一份 IR 产生逐字节一致的输出。"
+            "执行能力白名单、AFSIM 静态 lint 和四层想定验证，并可将结果写入文件。"
         )
 
     @property

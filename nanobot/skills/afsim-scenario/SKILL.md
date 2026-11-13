@@ -1,6 +1,6 @@
 ---
 name: afsim-scenario
-description: 把作战规划转化为 AFSIM 想定代码。支持两条入口：自然语言口述规划（nl_to_afsim 工具，经强类型 ScenarioIR 确定性编译）和 MissionOrch-LC 生成的结构化 COA Markdown（五步工具链）。触发词：自然语言想定、口述规划、COA、任务规划、AFSIM 想定、scenario generation、想定生成、COA 转 AFSIM。当用户用自然语言描述作战行动、或提供 COA MD 文件时使用。
+description: 把作战规划转化为 AFSIM 想定代码。支持两条入口：自然语言口述规划（nl_to_afsim 工具，由 AFSIM 想定编译器编译强类型 ScenarioIR）和 MissionOrch-LC 生成的结构化 COA Markdown（五步工具链）。触发词：自然语言想定、口述规划、COA、任务规划、AFSIM 想定、scenario generation、想定生成、COA 转 AFSIM。当用户用自然语言描述作战行动、或提供 COA MD 文件时使用。
 metadata:
   nanobot:
     requires:
@@ -18,7 +18,7 @@ metadata:
 
 | 输入形态 | 入口 | 说明 |
 | --- | --- | --- |
-| 自然语言口述规划（"2架J-16D突入，预警机在后方400km搜索…"） | `nl_to_afsim` | LLM 只填强类型 ScenarioIR，AFSIM 文本由模板确定性渲染 |
+| 自然语言口述规划（"2架J-16D突入，预警机在后方400km搜索…"） | `nl_to_afsim` | LLM 只填强类型 ScenarioIR，AFSIM 文本由 AFSIM 想定编译器渲染 |
 | MissionOrch-LC 输出的结构化 COA Markdown | `afsim_agent_loop` 五步工具链 | 依赖 COA 的实体清单/阶段/矩阵表格结构 |
 
 自然语言输入**不要**走五步工具链：`coa_parse` 需要 `## 六、实体清单` 这类固定表格，
@@ -33,7 +33,7 @@ metadata:
 ScenarioIR ──► Pydantic 强类型校验 + 能力白名单 + 静态 lint
   │  ← 报错回灌给模型改 IR；再叠一轮 IR 层战术合理性 refine
   ▼
-AFSIM 文本 ──► 确定性 Jinja2 渲染（同一 IR 必得同一输出，不调用大模型）
+AFSIM 文本 ──► AFSIM 想定编译器的 Jinja2 渲染（同一 IR 必得同一输出，不调用大模型）
   │
   ▼
 想定文件 .txt
@@ -49,7 +49,7 @@ AFSIM 文本 ──► 确定性 Jinja2 渲染（同一 IR 必得同一输出，
   `scenario_id`、`max_repair_rounds`（默认 3，含需求核对轮）、`audit_requirements`（默认 true）、
   `check_requirements`（默认 true，把需求里的数值约束抽成条款由代码核验，抽取调用不计轮数）。
 - `nl_scenario_plan` — 只产出 ScenarioIR，不落地 AFSIM，便于人工审阅 IR。
-- `scenario_compile` — ScenarioIR → AFSIM 文本，纯确定性，可反复重放。
+- `scenario_compile` — AFSIM 想定编译器（AFSIM Scenario Compiler）的工具入口：ScenarioIR → AFSIM 文本，不调用大模型，同一 IR 可反复重放。
 
 API key 走 `DEEPSEEK_API_KEY` 环境变量，别写进工具参数（会进 trace 和反思记忆）。
 `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` 可切换到任意 OpenAI 兼容服务。

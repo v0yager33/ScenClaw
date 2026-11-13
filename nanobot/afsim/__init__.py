@@ -1,4 +1,4 @@
-"""确定性 AFSIM 编译后端 — ScenarioIR → AFSIM 2.9 文本。
+"""AFSIM 想定编译器（AFSIM Scenario Compiler）— ScenarioIR → AFSIM 2.9 文本。
 
 本包是 ScenClaw 里唯一被允许直接产出 AFSIM 语法的组件。它刻意做得很小:
 

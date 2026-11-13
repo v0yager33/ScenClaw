@@ -683,6 +683,20 @@ def test_plausibility_flags_shots_beyond_quantity() -> None:
 # ── 提示词内容 ──────────────────────────────────────────────────────
 
 
+def test_compiler_name_is_consistent_in_tool_and_system_prompt() -> None:
+    """模型提示和工具说明使用统一名称，保留语义抽取边界和工具调用名。"""
+    llm = ScriptedLLM([_dumps(_valid_ir())])
+    ScenarioIRPlanner(llm=llm).plan("任务")
+    system_prompt = llm.calls[0][0]["content"]
+    assert "下游 AFSIM 想定编译器" in system_prompt
+    assert "不要输出任何 AFSIM 语法" in system_prompt
+    assert "确定性编译器" not in system_prompt
+    tool = ScenarioCompileTool()
+    assert tool.name == "scenario_compile"
+    assert "AFSIM 想定编译器" in tool.description
+    assert "AFSIM Scenario Compiler" in tool.description
+
+
 def test_hints_are_injected_into_prompt() -> None:
     llm = ScriptedLLM([_dumps(_valid_ir())])
     ScenarioIRPlanner(llm=llm).plan(

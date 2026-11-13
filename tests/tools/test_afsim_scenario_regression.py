@@ -6,7 +6,7 @@
    语料做基准。这些文件是 mission.exe 跑得通的, 验证器若把它们判成 error, 说明规则
    本身有问题 —— 而且危害不止于"分数不好看": Agent Loop 会拿着假错误去"修"正确的
    代码, 越修越坏。
-2. **确定性编译器输出必须自洽**: ScenarioIR 编译出来的 AFSIM 文本要同时通过
+2. **AFSIM 想定编译器输出必须自洽**: ScenarioIR 编译出来的 AFSIM 文本要同时通过
    ``nanobot.afsim.lint_afsim`` 和 ``ScenarioValidator``。两个检查器口径不一致时,
    自修正循环会陷入互相拆台。
 
@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from nanobot.afsim import AfsimCompiler, ScenarioIR, lint_afsim
+from nanobot.afsim import AfsimCompiler, ScenarioIR, compile_scenario, lint_afsim
 from nanobot.afsim.compiler import _latitude, _longitude
 from nanobot.agent.tools.scenario_validator_tool import (
     ScenarioValidator,
@@ -227,7 +227,7 @@ def test_undefined_wsf_prefixed_base_still_warns_for_custom_declaration() -> Non
     assert "WSF_UNKNOWN_PARENT" in hits[0].description
 
 
-# ── 确定性编译器与验证器口径一致 ────────────────────────────────────
+# ── AFSIM 想定编译器与验证器口径一致 ────────────────────────────────
 
 
 def _minimal_ir() -> ScenarioIR:
@@ -334,6 +334,7 @@ def test_compiler_output_passes_both_checkers() -> None:
 def test_compiler_is_deterministic() -> None:
     ir = _minimal_ir()
     assert AfsimCompiler().compile(ir) == AfsimCompiler().compile(ir)
+    assert compile_scenario(ir) == AfsimCompiler().compile(ir)
 
 
 # ── 坐标必须是 d:m:s ────────────────────────────────────────────────

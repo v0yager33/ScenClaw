@@ -7,7 +7,7 @@ ScenClaw 在 nanobot 之上增加了一套 AFSIM 想定生成工具，把作战�
 | 自然语言 | 一段中文或英文的作战描述 | `nl_to_afsim` | 需要（DeepSeek 兼容接口） |
 | 结构化 COA | MissionOrch-LC 输出的 COA Markdown | `afsim_agent_loop` | `classic` 模式不需要，`react` 模式需要 |
 
-自然语言入口的流程是：大模型只负责把需求抽取成强类型的 `ScenarioIR`，每个候选 IR 都要经过 Pydantic schema、编译器能力白名单和 AFSIM 静态 lint 检查，报错回灌给模型做有限轮修复（extract → repair → refine）；最后由确定性编译器渲染成 AFSIM 文本。修复发生在 IR 上，不直接修改生成的文本，所以同一份 IR 每次编译的结果逐字节一致。
+自然语言入口的流程是：大模型只负责把需求抽取成强类型的 `ScenarioIR`，每个候选 IR 都要经过 Pydantic schema、编译器能力白名单和 AFSIM 静态 lint 检查，报错回灌给模型做有限轮修复（extract → repair → refine）；最后由 AFSIM 想定编译器（AFSIM Scenario Compiler）渲染成 AFSIM 文本。修复发生在 IR 上，不直接修改生成的文本，所以同一份 IR 每次编译的结果逐字节一致。
 
 ## 1. 环境准备
 
@@ -85,7 +85,7 @@ output/air_8v8/
 
 ## 3. 修改 IR 后重新编译
 
-想调整开火时间、航路点这类细节时，不必重新调用大模型：直接改导出的 IR，再用 `scenario_compile` 确定性编译。
+想调整开火时间、航路点这类细节时，不必重新调用大模型：直接改导出的 IR，再通过 `scenario_compile` 调用 AFSIM 想定编译器。
 
 ```python
 import asyncio, json
@@ -173,7 +173,7 @@ open("sead.txt", "w", encoding="utf-8").write(result["scenario_code"])
 |---|---|
 | `nl_to_afsim` | 自然语言 → AFSIM 想定项目（端到端） |
 | `nl_scenario_plan` | 自然语言 → ScenarioIR |
-| `scenario_compile` | ScenarioIR → AFSIM 文本（确定性，不调用大模型） |
+| `scenario_compile` | AFSIM 想定编译器：ScenarioIR → AFSIM 文本（同一 IR 输出一致，不调用大模型） |
 | `afsim_agent_loop` | COA Markdown → AFSIM，带自修正循环（classic / react） |
 | `coa_parse` | 解析 COA Markdown |
 | `coord_resolve` | 地理参照解算为 WGS-84 坐标 |

@@ -60,7 +60,7 @@ _BLOCK_PAIRS: dict[str, str] = {
     "signal_processor": "end_signal_processor",
     "state": "end_state",
     "phase": "end_phase",
-    # ── 输出/观察者块 (确定性编译器会生成 event_output / event_pipe) ──
+    # ── 输出/观察者块 (AFSIM 想定编译器会生成 event_output / event_pipe) ──
     "event_output": "end_event_output",
     "event_pipe": "end_event_pipe",
     "observer": "end_observer",
@@ -104,7 +104,7 @@ _BLOCK_PAIRS: dict[str, str] = {
     "terrain": "end_terrain",
 }
 
-# AFSIM 基类型关键字 (从真实想定与确定性编译器输出中提取)
+# AFSIM 基类型关键字 (从真实想定与 AFSIM 想定编译器输出中提取)
 #
 # 这只是"已知good"清单, 不是 AFSIM 全集。未登记的 WSF_* 只报 warning 而不是
 # error: AFSIM 内置类型远多于此, 报 error 会把合法想定判死。
