@@ -740,7 +740,45 @@ export interface InboundTurnMetadata {
   turn_seq?: number;
 }
 
+export type PlanningAction = "status" | "list" | "get" | "create" | "save" | "cancel" | "handoff";
+export interface PlanningErrorPayload { code: string; message: string; status?: number }
+export interface PlanningTask {
+  id: string; phase_id: string; phase_name: string; unit_id: string;
+  unit_name: string; action_index: number; text: string;
+}
+export interface PlanningIndex {
+  plan_id: string; mission: string; revision: number; job_id?: string | null;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled" | "timed_out" | "interrupted";
+  created_at: string; logs?: { type: string; stage: string; ts: string }[];
+  error?: PlanningErrorPayload | null;
+}
+export interface PlanningDocument {
+  plan_id: string; revision: number; markdown: string; content_hash: string;
+  tasks: PlanningTask[]; coa: Record<string, unknown>; validation: Record<string, unknown>;
+  generation?: { final_score?: number; iterations?: number }; source_revision?: number;
+}
+export interface PlanningDetail {
+  plan: PlanningIndex; document: PlanningDocument | null; service_error?: PlanningErrorPayload;
+}
+export interface PlanningStatus {
+  enabled: boolean; available: boolean; poll_interval_s: number; error?: PlanningErrorPayload;
+}
+export interface PlanningPreview {
+  snapshot_markdown: string; snapshot_hash: string; selection_note: string; selected_task_ids: string[];
+}
+export interface PlanningHandoff {
+  chat_id: string; handoff_id: string; status: "dispatched" | "dispatching" | "interrupted";
+  plan_id: string; revision: number; coa_path: string; output_dir: string;
+}
+export interface PlanningRequest {
+  type: "planning"; action: PlanningAction; request_id: string; workspace_scope?: WorkspaceScopePayload;
+  plan_id?: string; revision?: number; base_revision?: number; mission?: string;
+  generation_request_id?: string; markdown?: string; selected_task_ids?: string[] | null;
+  content_hash?: string; handoff_id?: string; preview?: boolean;
+}
+
 export type InboundEvent =
+  | { event: "planning_response"; request_id: string; ok: boolean; data?: unknown; error?: PlanningErrorPayload }
   | { event: "ready"; chat_id: string; client_id: string }
   | { event: "attached"; chat_id: string }
   | ({
@@ -898,6 +936,7 @@ export interface FilePreviewPayload {
 }
 
 export type Outbound =
+  | PlanningRequest
   | { type: "new_chat"; workspace_scope?: WorkspaceScopePayload }
   | { type: "fork_chat"; source_chat_id: string; before_user_index: number; title?: string }
   | { type: "attach"; chat_id: string }

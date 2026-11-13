@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import i18n from "@/i18n";
-import type { ChatSummary, SessionAutomationJob } from "@/lib/types";
+import type { ChatSummary, ConnectionStatus, PlanningRequest, SessionAutomationJob, WorkspaceScopePayload } from "@/lib/types";
 
 const connectSpy = vi.fn();
 const refreshSpy = vi.fn();
@@ -12,6 +12,10 @@ const getSessionAutomationsSpy = vi.fn<(key: string) => Promise<SessionAutomatio
 const toggleThemeSpy = vi.fn();
 const updateUrlSpy = vi.fn();
 const attachSpy = vi.fn();
+const sendMessageSpy = vi.fn();
+const rememberChatSpy = vi.fn();
+const planningSpy = vi.fn<(request: Omit<PlanningRequest, "type" | "request_id">) => Promise<unknown>>();
+let mockConnectionStatus: ConnectionStatus = "idle";
 const runStatusHandlers = new Set<(chatId: string, startedAt: number | null) => void>();
 let mockSessions: ChatSummary[] = [];
 const HERO_GREETING_PATTERN =
@@ -141,11 +145,19 @@ vi.mock("@/hooks/useSessions", async (importOriginal) => {
     ...actual,
     useSessions: () => {
       const [sessions, setSessions] = React.useState(mockSessions);
+      const rememberChat = React.useCallback((chatId: string, workspaceScope?: WorkspaceScopePayload | null) => {
+        rememberChatSpy(chatId, workspaceScope);
+        setSessions((prev: ChatSummary[]) => prev.some((session) => session.chatId === chatId) ? prev : [
+          { key: `websocket:${chatId}`, channel: "websocket", chatId, createdAt: "offline", updatedAt: "offline", preview: "", workspaceScope },
+          ...prev,
+        ]);
+      }, []);
       return {
         sessions,
         loading: false,
         error: null,
         refresh: refreshSpy,
+        rememberChat,
         createChat: createChatSpy,
         forkChat: async () => "fork-chat",
         getSessionAutomations: getSessionAutomationsSpy,
@@ -185,9 +197,11 @@ vi.mock("@/lib/bootstrap", () => ({
   clearSavedSecret: vi.fn(),
 }));
 
-vi.mock("@/lib/nanobot-client", () => {
+vi.mock("@/lib/nanobot-client", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/nanobot-client")>();
   class MockClient {
-    status = "idle" as const;
+    status = mockConnectionStatus;
+    planning = planningSpy;
     defaultChatId: string | null = null;
     connect = connectSpy;
     onStatus = () => () => {};
@@ -201,14 +215,14 @@ vi.mock("@/lib/nanobot-client", () => {
     };
     getRunStartedAt = () => null;
     getGoalState = () => undefined;
-    sendMessage = vi.fn();
+    sendMessage = sendMessageSpy;
     newChat = vi.fn();
     attach = attachSpy;
     close = vi.fn();
     updateUrl = updateUrlSpy;
   }
 
-  return { NanobotClient: MockClient };
+  return { ...actual, NanobotClient: MockClient };
 });
 
 import { deriveWsUrl, fetchBootstrap } from "@/lib/bootstrap";
@@ -226,6 +240,12 @@ describe("App layout", () => {
     getSessionAutomationsSpy.mockReset().mockResolvedValue([]);
     toggleThemeSpy.mockReset();
     attachSpy.mockReset();
+    sendMessageSpy.mockReset();
+    rememberChatSpy.mockReset();
+    mockConnectionStatus = "idle";
+    planningSpy.mockReset().mockImplementation(async (request) => request.action === "status"
+      ? { enabled: false, available: false, poll_interval_s: 2, error: { code: "not_configured", message: "未启用规划" } }
+      : { plans: [] });
     runStatusHandlers.clear();
     window.history.replaceState(null, "", "/");
     setNavigatorPlatform("Linux x86_64");
@@ -248,6 +268,114 @@ describe("App layout", () => {
 
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  it("从侧栏进入规划页并保留原聊天挂载", async () => {
+    mockConnectionStatus = "open";
+    const { container } = render(<App />);
+    await waitFor(() => expect(connectSpy).toHaveBeenCalled());
+    const sidebar = screen.getByRole("navigation", { name: "Sidebar navigation" });
+    fireEvent.click(within(sidebar).getByRole("button", { name: "任务规划" }));
+    expect(await screen.findByRole("heading", { name: "任务规划" })).toBeInTheDocument();
+    expect(window.location.hash).toContain("#/planning");
+    expect(await screen.findByText(/未启用规划/)).toBeInTheDocument();
+    expect(document.title).toBe("任务规划 · nanobot");
+    expect(container.querySelector(".invisible")).toBeInTheDocument();
+    fireEvent.click(within(sidebar).getByRole("button", { name: "New chat" }));
+    expect(await screen.findByText(HERO_GREETING_PATTERN)).toBeInTheDocument();
+    expect(planningSpy.mock.calls.some(([request]) => request.action === "create")).toBe(false);
+  });
+
+  it("按 hash 恢复规划查询而不重新生成", async () => {
+    mockConnectionStatus = "open";
+    const id = "00000000-0000-4000-8000-000000000001";
+    window.history.replaceState(null, "", `/#/planning/${id}`);
+    planningSpy.mockImplementation(async (request) => {
+      if (request.action === "status") return { enabled: true, available: true, poll_interval_s: 2 };
+      if (request.action === "list") return { plans: [] };
+      return { plan: { plan_id: id, mission: "恢复原规划", revision: 0, status: "interrupted", created_at: "offline" }, document: null };
+    });
+    render(<App />);
+    expect(await screen.findByText("恢复原规划")).toBeInTheDocument();
+    expect(planningSpy).toHaveBeenCalledWith(expect.objectContaining({ action: "get", plan_id: id }));
+    expect(planningSpy.mock.calls.some(([request]) => request.action === "create")).toBe(false);
+  });
+
+  it("规划交接后打开原 ThreadShell，第二轮沿用会话与工作区", async () => {
+    mockConnectionStatus = "open";
+    const id = "00000000-0000-4000-8000-000000000001";
+    const scope: WorkspaceScopePayload = { project_path: "/tmp/planning-workspace", access_mode: "restricted", restrict_to_workspace: true };
+    window.history.replaceState(null, "", `/#/planning/${id}`);
+    const settings = { ...baseSettingsPayload(), providers: [{ name: "openai", label: "OpenAI", configured: true }] };
+    mockFetchRoutes({
+      "/api/settings": settings,
+      "/api/workspaces": { schema_version: 1, default_access_mode: "restricted", default_scope: scope, controls: { can_change_project: false, can_use_full_access: false } },
+      "/api/sessions/websocket%3Ascenario-chat/webui-thread?limit=160&direction=latest": {
+        schemaVersion: 1, messages: [
+          { id: "first-user", role: "user", content: "读取固定 COA 快照生成想定", createdAt: 1 },
+          { id: "first-error", role: "assistant", content: "首轮离线错误：需要修改参数", createdAt: 2 },
+        ],
+      },
+    });
+    planningSpy.mockImplementation(async (request) => {
+      if (request.action === "status") return { enabled: true, available: true, poll_interval_s: 2 };
+      if (request.action === "list") return { plans: [] };
+      if (request.action === "handoff") return { chat_id: "scenario-chat", handoff_id: "offline", status: "dispatched", plan_id: id, revision: 1, coa_path: "scenarios/offline/coa.md", output_dir: "scenarios/offline" };
+      return {
+        plan: { plan_id: id, mission: "离线任务", revision: 1, status: "completed", created_at: "offline" },
+        document: { plan_id: id, revision: 1, markdown: "完整 Markdown", content_hash: "hash", coa: {}, validation: {}, tasks: [
+          { id: "P1:U1:0", phase_id: "P1", phase_name: "阶段一", unit_id: "U1", unit_name: "单元一", action_index: 0, text: "侦察" },
+        ] },
+      };
+    });
+    // 模拟真实 refresh 吞掉列表错误的返回；rememberChat 保留已确认会话。
+    refreshSpy.mockResolvedValue(undefined);
+    const { container } = render(<App />);
+    await screen.findByText("完整 Markdown");
+    await screen.findByText(scope.project_path);
+    const handoffButton = screen.getByRole("button", { name: "生成想定并进入聊天" });
+    await waitFor(() => expect(handoffButton).toBeEnabled());
+    fireEvent.click(handoffButton);
+    expect(await screen.findByText("首轮离线错误：需要修改参数")).toBeInTheDocument();
+    expect(window.location.hash).toBe("#/chat/websocket%3Ascenario-chat");
+    expect(container.querySelector("main .invisible")).not.toBeInTheDocument();
+    expect(rememberChatSpy).toHaveBeenCalledWith("scenario-chat", expect.objectContaining(scope));
+    const input = screen.getByRole("textbox", { name: i18n.t("thread.composer.inputAria") });
+    fireEvent.change(input, { target: { value: "按反馈修改同一想定" } });
+    const send = screen.getByRole("button", { name: i18n.t("thread.composer.send") });
+    await waitFor(() => expect(send).toBeEnabled());
+    fireEvent.click(send);
+    expect(sendMessageSpy).toHaveBeenCalledWith("scenario-chat", "按反馈修改同一想定", undefined,
+      expect.objectContaining({ workspaceScope: expect.objectContaining(scope), turnId: expect.any(String) }));
+    expect(createChatSpy).not.toHaveBeenCalled();
+    expect(planningSpy.mock.calls.filter(([request]) => request.action === "handoff")).toHaveLength(1);
+    expect(screen.getByText("首轮离线错误：需要修改参数")).toBeInTheDocument();
+  });
+
+  it("取消 hash 离开时恢复规划路由并保留草稿", async () => {
+    mockConnectionStatus = "open";
+    const id = "00000000-0000-4000-8000-000000000001";
+    window.history.replaceState(null, "", `/#/planning/${id}`);
+    planningSpy.mockImplementation(async (request) => {
+      if (request.action === "status") return { enabled: true, available: true, poll_interval_s: 2 };
+      if (request.action === "list") return { plans: [] };
+      return { plan: { plan_id: id, mission: "编辑任务", revision: 1, status: "completed", created_at: "offline" },
+        document: { plan_id: id, revision: 1, markdown: "原规划", content_hash: "hash", tasks: [], coa: {}, validation: {} } };
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    try {
+      render(<App />);
+      await screen.findByText("原规划");
+      fireEvent.click(screen.getByRole("tab", { name: "编辑 Markdown" }));
+      fireEvent.change(screen.getByRole("textbox", { name: "完整规划 Markdown" }), { target: { value: "未保存的草稿" } });
+      await act(async () => {
+        window.history.replaceState(null, "", "/#/settings");
+        window.dispatchEvent(new HashChangeEvent("hashchange"));
+      });
+      expect(window.location.hash).toBe(`#/planning/${id}`);
+      expect(screen.getByRole("textbox", { name: "完整规划 Markdown" })).toHaveValue("未保存的草稿");
+      expect(confirm).toHaveBeenCalledTimes(1);
+    } finally { confirm.mockRestore(); }
   });
 
   it("keeps sidebar layout out of the main thread width contract", async () => {

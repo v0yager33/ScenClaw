@@ -2,6 +2,7 @@ import { useState, type ReactNode } from "react";
 import {
   Archive,
   Brain,
+  ClipboardList,
   Menu,
   Search,
   Settings,
@@ -36,8 +37,9 @@ interface SidebarProps {
   onOpenSettings: () => void;
   onOpenApps: () => void;
   onOpenSkills: () => void;
+  onOpenPlanning?: () => void;
   onOpenSearch: () => void;
-  activeUtility?: "apps" | "skills" | null;
+  activeUtility?: "apps" | "skills" | "planning" | null;
   onToggleArchived: () => void;
   onCollapse: () => void;
   onExpand?: () => void;
@@ -166,6 +168,15 @@ export function Sidebar(props: SidebarProps) {
           active={props.activeUtility === "skills"}
           icon={<Brain className="h-4 w-4" />}
         />
+        {props.onOpenPlanning && (
+          <SidebarActionButton
+            collapsed={collapsed}
+            label="任务规划"
+            onClick={props.onOpenPlanning}
+            active={props.activeUtility === "planning"}
+            icon={<ClipboardList className="h-4 w-4" />}
+          />
+        )}
         {props.archivedCount ? (
           <SidebarActionButton
             collapsed={collapsed}

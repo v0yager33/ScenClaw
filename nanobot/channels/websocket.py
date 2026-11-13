@@ -643,9 +643,16 @@ class WebSocketChannel(BaseChannel):
         connection: Any,
         client_id: str,
         envelope: dict[str, Any],
-    ) -> None:
+    ) -> bool | None:
         """Route one typed inbound envelope (``new_chat`` / ``attach`` / ``message``)."""
         t = envelope.get("type")
+        if t == "planning":
+            if self.gateway.planning is None:
+                await self._send_event(connection, "planning_response", request_id=envelope.get("request_id"),
+                                       ok=False, error={"code": "not_configured", "message": "规划服务未配置"})
+            else:
+                await self.gateway.planning.submit(self, connection, client_id, envelope)
+            return
         if t == "new_chat":
             new_id = str(uuid.uuid4())
             scope = await self._workspace_scope_or_error(
@@ -794,7 +801,8 @@ class WebSocketChannel(BaseChannel):
                 metadata=metadata,
                 is_dm=False,
             )
-            return
+            # 交接适配器需要确认普通消息完成发布；现有调用者可忽略返回值。
+            return self.is_allowed(client_id)
         await self._send_event(connection, "error", detail=f"unknown type: {t!r}")
 
     async def _workspace_scope_or_error(
@@ -830,6 +838,8 @@ class WebSocketChannel(BaseChannel):
             except Exception as e:
                 self.logger.warning("server task error during shutdown: {}", e)
             self._server_task = None
+        if self.gateway.planning is not None:
+            await self.gateway.planning.close()
         self._subs.clear()
         self._conn_chats.clear()
         self._conn_default.clear()

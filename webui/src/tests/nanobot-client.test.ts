@@ -70,6 +70,71 @@ afterEach(() => {
 });
 
 describe("NanobotClient", () => {
+  function planningClient(reconnect = false) {
+    const client = new NanobotClient({ url: "ws://test", reconnect, maxBackoffMs: 5,
+      socketFactory: (url) => new FakeSocket(url) as unknown as WebSocket });
+    client.connect();
+    lastSocket().fakeOpen();
+    return client;
+  }
+
+  it("按 request_id 处理乱序规划响应且不完成待创建聊天", async () => {
+    const client = planningClient();
+    const chat = client.newChat();
+    const one = client.planning({ action: "list" });
+    const two = client.planning({ action: "status" });
+    const frames = lastSocket().sent.map((s) => JSON.parse(s)).filter((f) => f.type === "planning");
+    expect(frames[0].request_id).not.toBe(frames[1].request_id);
+    lastSocket().fakeMessage({ event: "planning_response", request_id: frames[1].request_id, ok: true, data: { available: true } });
+    lastSocket().fakeMessage({ event: "planning_response", request_id: "unknown", ok: false, error: { code: "forbidden", message: "拒绝" } });
+    lastSocket().fakeMessage({ event: "planning_response", request_id: frames[0].request_id, ok: false, error: { code: "version_conflict", message: "保留草稿" } });
+    await expect(two).resolves.toEqual({ available: true });
+    await expect(one).rejects.toMatchObject({ code: "version_conflict" });
+    lastSocket().fakeMessage({ event: "attached", chat_id: "original-chat" });
+    await expect(chat).resolves.toBe("original-chat");
+    client.close();
+  });
+
+  it("规划超时后清理 pending 并忽略迟到响应", async () => {
+    const client = planningClient();
+    const request = client.planning({ action: "get", plan_id: "plan" }, 100);
+    const assertion = expect(request).rejects.toMatchObject({ code: "timeout" });
+    const frame = JSON.parse(lastSocket().sent.at(-1)!);
+    await vi.advanceTimersByTimeAsync(101);
+    await assertion;
+    lastSocket().fakeMessage({ event: "planning_response", request_id: frame.request_id, ok: true, data: {} });
+    const next = client.planning({ action: "status" });
+    lastSocket().fakeMessage({ event: "planning_response", request_id: JSON.parse(lastSocket().sent.at(-1)!).request_id, ok: true, data: "next" });
+    await expect(next).resolves.toBe("next");
+    client.close();
+  });
+
+  it("断线拒绝规划请求且重连不重放收费生成", async () => {
+    const client = planningClient(true);
+    const pending = client.planning({ action: "create", mission: "离线任务", generation_request_id: "source-id" });
+    const assertion = expect(pending).rejects.toMatchObject({ code: "disconnected" });
+    lastSocket().close();
+    await assertion;
+    await expect(client.planning({ action: "create", mission: "不得重发" })).rejects.toMatchObject({ code: "disconnected" });
+    await vi.advanceTimersByTimeAsync(10);
+    lastSocket().fakeOpen();
+    expect(lastSocket().sent.some((s) => JSON.parse(s).type === "planning")).toBe(false);
+    client.sendMessage("scenario-chat", "第二轮修改", undefined, { turnId: "second" });
+    expect(JSON.parse(lastSocket().sent.at(-1)!)).toMatchObject({ type: "message", chat_id: "scenario-chat", turn_id: "second" });
+    client.close();
+  });
+
+  it("规划 pending 容量有界且不阻塞普通聊天", async () => {
+    const client = planningClient();
+    const requests = Array.from({ length: 8 }, () => client.planning({ action: "status" }));
+    const assertions = requests.map((r) => expect(r).rejects.toMatchObject({ code: "disconnected" }));
+    await expect(client.planning({ action: "status" })).rejects.toMatchObject({ code: "busy" });
+    client.sendMessage("chat", "普通消息");
+    expect(JSON.parse(lastSocket().sent.at(-1)!)).toMatchObject({ type: "message", content: "普通消息" });
+    client.close();
+    await Promise.all(assertions);
+  });
+
   it("routes events to the matching chat handler", () => {
     const client = new NanobotClient({
       url: "ws://test",

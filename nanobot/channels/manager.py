@@ -118,6 +118,7 @@ class ChannelManager:
                     workspace = Path(self.config.workspace_path)
                     gateway = build_gateway_services(
                         config=parsed,
+                        planning_config=self.config.planning,
                         bus=self.bus,
                         session_manager=self._session_manager,
                         static_dist_path=static_path,

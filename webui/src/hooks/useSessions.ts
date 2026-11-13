@@ -48,6 +48,7 @@ export function useSessions(): {
   loading: boolean;
   error: string | null;
   refresh: () => Promise<void>;
+  rememberChat: (chatId: string, workspaceScope?: WorkspaceScopePayload | null) => void;
   createChat: (workspaceScope?: WorkspaceScopePayload | null) => Promise<string>;
   forkChat: (sourceChatId: string, beforeUserIndex: number, title?: string) => Promise<string>;
   deleteChat: (
@@ -100,13 +101,11 @@ export function useSessions(): {
     });
   }, [client, refresh]);
 
-  const createChat = useCallback(async (workspaceScope?: WorkspaceScopePayload | null): Promise<string> => {
-    const chatId = await client.newChat(CHAT_CREATE_TIMEOUT_MS, workspaceScope);
+  const rememberChat = useCallback((chatId: string, workspaceScope?: WorkspaceScopePayload | null) => {
     const key = `websocket:${chatId}`;
     optimisticKeysRef.current.add(key);
-    // Optimistic insert; a subsequent refresh will replace it with the
-    // authoritative row once the server persists the session.
-    setSessions((prev) => [
+    // 服务已确认创建会话；列表刷新失败或迟到时仍可打开原聊天。
+    setSessions((prev) => prev.some((session) => session.key === key) ? prev : [
       {
         key,
         channel: "websocket",
@@ -117,10 +116,15 @@ export function useSessions(): {
         preview: "",
         workspaceScope: workspaceScope ?? null,
       },
-      ...prev.filter((s) => s.key !== key),
+      ...prev,
     ]);
+  }, []);
+
+  const createChat = useCallback(async (workspaceScope?: WorkspaceScopePayload | null): Promise<string> => {
+    const chatId = await client.newChat(CHAT_CREATE_TIMEOUT_MS, workspaceScope);
+    rememberChat(chatId, workspaceScope);
     return chatId;
-  }, [client]);
+  }, [client, rememberChat]);
 
   const forkChat = useCallback(async (
     sourceChatId: string,
@@ -172,6 +176,7 @@ export function useSessions(): {
     loading,
     error,
     refresh,
+    rememberChat,
     createChat,
     forkChat,
     deleteChat,

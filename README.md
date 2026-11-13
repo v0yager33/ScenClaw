@@ -378,6 +378,48 @@ The WebUI is served by the WebSocket channel on port `8765` by default. The gate
 > [!TIP]
 > Working on the WebUI itself? Check out [`webui/README.md`](./webui/README.md) for the Vite dev server (HMR) workflow.
 
+### 任务规划与想定联动
+
+从侧栏“任务规划”（`#/planning`）进入：自然语言生成 → 预览／完整 Markdown 编辑 → 保存版本 → 整份或阶段／行动选择 → 交接预览 → 生成想定并进入原聊天。后续修改继续使用同一会话、流式回复和工具／文件预览。
+
+先按 [MissionOrch-LC 服务说明](../MissionOrch-LC/README.md#与-scenclaw-webui-联动) 启动独立规划服务。将下面字段合并到 nanobot 根配置，不替换现有模型、工具或白名单。两端令牌使用相同的部署环境变量值：
+
+```json
+{
+  "planning": {
+    "enabled": true,
+    "apiBase": "http://127.0.0.1:8502",
+    "apiToken": "${PLANNING_SERVICE_TOKEN}",
+    "requestTimeoutS": 30,
+    "pollIntervalS": 2,
+    "maxPayloadBytes": 2097152
+  },
+  "tools": {
+    "ssrfWhitelist": ["127.0.0.1/32"]
+  }
+}
+```
+
+`planning` 默认关闭。令牌只由网关使用；浏览器不提供 MissionOrch 地址，不在 query／header 携带规划正文。私有地址必须由管理员按需显式授权 CIDR／域名，不自动修改白名单，不跟随重定向。远程部署使用 HTTPS 与已有 WebUI 鉴权。配置在网关启动时读取，请在安排好的启动窗口应用，不必操作正在使用的服务。
+
+从源码使用本功能时，需要在已有前端依赖环境构建新页面：`npm --prefix webui run build`（或既有 Bun 工作流）。新页面未包含在旧版 wheel 的静态资源中。
+
+版本保存在工作区 `.nanobot/plans/<plan_id>/`；保存使用 `base_revision` 检查冲突。完整 Markdown（含实体、地理与附加章节）为内容源。保存／切换版本会清空旧选择；未保存时交接被禁用，可“保存并继续”。取消离开保留草稿，断线后只查询原作业，不自动重发生成。
+
+每次交接固定版本、选择与 hash，创建 `scenarios/<handoff_id>/coa.md`、`source.json` 和新的 scoped 会话。想定及当前结构数据在同一场景目录生成与续修；原快照不覆盖。重复同一交接 ID 不重复首轮。派发中断时打开已有会话确认，不能自动重放。新规划版本不会影响已有想定，需要用户显式再次交接。
+
+状态排查：
+- `not_configured`：检查启用状态、环境变量与令牌；已保存规划仍可查看。
+- `target_blocked`：检查固定服务地址、DNS 与显式 `ssrfWhitelist`。
+- `unauthorized`、`service_unavailable`、`service_timeout`：分别检查令牌、服务连接和请求超时。
+- `queue_full`／`timed_out`：检查 MissionOrch 容量／单作业超时；不要反复提交收费生成。
+- `version_conflict`：保留草稿，刷新并核对版本；不要用旧行动索引交接。
+- `invalid_references`／`unparseable_plan`：修正重复 ID、悬空实体／地理引用或矩阵结构。
+
+部分选择会提示选中文本／触发条件中的显式未选阶段或行动 ID，不推断依赖图、不增加前置行动；其他文本依赖需在原聊天澄清。原生成评分只属于来源版本；结构检查不代表想定已通过 lint／仿真。场景目录规则沿用 `afsim-scenario` 工具链与会话约定，文件工具仍遵循既有工作区访问控制。
+
+离线回归：`python -m pytest tests/test_planning.py -q`；前端：`npm --prefix webui test -- src/tests/planning.test.tsx src/tests/nanobot-client.test.ts src/tests/app-layout.test.tsx`。测试采用 mock 服务／provider／想定工具，不调用真实模型、想定 lint 或仿真。
+
 ## 🏗️ Architecture
 
 <p align="center">

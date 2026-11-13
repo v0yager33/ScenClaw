@@ -351,6 +351,17 @@ class ToolsConfig(Base):
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
 
 
+class PlanningConfig(Base):
+    """独立 MissionOrch 服务；私有地址仍需显式 SSRF 白名单。"""
+
+    enabled: bool = False
+    api_base: str = "http://127.0.0.1:8502"
+    api_token: str = Field(default="", repr=False)
+    request_timeout_s: float = Field(default=30, gt=0, le=300)
+    poll_interval_s: float = Field(default=2, ge=0.5, le=60)
+    max_payload_bytes: int = Field(default=2 * 1024 * 1024, ge=1024, le=2 * 1024 * 1024)
+
+
 class TrajectoryConfig(Base):
     """仅追加的本地 LLM/工具轨迹；空目录使用 workspace/trajectories。"""
 
@@ -369,6 +380,7 @@ class Config(BaseSettings):
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     trajectory: TrajectoryConfig = Field(default_factory=TrajectoryConfig)
+    planning: PlanningConfig = Field(default_factory=PlanningConfig)
     model_presets: dict[str, ModelPresetConfig] = Field(
         default_factory=dict,
         validation_alias=AliasChoices("modelPresets", "model_presets"),

@@ -8,8 +8,10 @@ from typing import Any, Callable
 
 from loguru import logger as default_logger
 
+from nanobot.config.schema import PlanningConfig
 from nanobot.webui.gateway_tokens import GatewayTokenStore
 from nanobot.webui.media_gateway import WebUIMediaGateway
+from nanobot.webui.planning_ws import PlanningGateway
 from nanobot.webui.transcript import WebUITranscriptRecorder
 from nanobot.webui.workspaces import WebUIWorkspaceController
 from nanobot.webui.ws_http import GatewayHTTPHandler
@@ -27,6 +29,7 @@ class GatewayServices:
     session_manager: Any | None
     cron_service: Any | None
     cron_pending_job_ids: Callable[[str], set[str]] | None
+    planning: PlanningGateway | None = None
 
 
 def build_gateway_services(
@@ -44,6 +47,7 @@ def build_gateway_services(
     cron_service: Any | None = None,
     cron_pending_job_ids: Callable[[str], set[str]] | None = None,
     logger: Any = default_logger,
+    planning_config: PlanningConfig | None = None,
 ) -> GatewayServices:
     tokens = GatewayTokenStore()
     media = WebUIMediaGateway(
@@ -82,4 +86,5 @@ def build_gateway_services(
         session_manager=session_manager,
         cron_service=cron_service,
         cron_pending_job_ids=cron_pending_job_ids,
+        planning=PlanningGateway(planning_config or PlanningConfig()),
     )

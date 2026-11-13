@@ -2,6 +2,7 @@ import type {
   ConnectionStatus,
   InboundEvent,
   Outbound,
+  PlanningRequest,
   OutboundCliAppMention,
   OutboundImageGeneration,
   OutboundMcpPresetMention,
@@ -52,6 +53,10 @@ function wsInboundDebugEnabled(): boolean {
 /** Shorten streaming text fields so logging stays usable for huge deltas. */
 function summarizeInboundWsPayload(ev: InboundEvent): unknown {
   const kind = (ev as { event?: string }).event;
+  if (ev.event === "planning_response") {
+    // 规划正文与快照不写入调试控制台，只保留请求关联和错误码。
+    return { event: ev.event, request_id: ev.request_id, ok: ev.ok, code: ev.error?.code };
+  }
   if (kind !== "delta" && kind !== "reasoning_delta") return ev;
   const row = { ...(ev as object) } as Record<string, unknown>;
   const text = typeof row.text === "string" ? row.text : "";
@@ -93,6 +98,16 @@ interface PendingNewChat {
   resolve: (chatId: string) => void;
   reject: (err: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+}
+
+interface PendingPlanning {
+  resolve: (data: unknown) => void;
+  reject: (err: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+export class PlanningRpcError extends Error {
+  constructor(public code: string, message: string) { super(message); }
 }
 
 interface PendingTranscription {
@@ -139,6 +154,7 @@ export class NanobotClient {
   private goalStateByChatId = new Map<string, GoalStateWsPayload>();
   private pendingNewChat: PendingNewChat | null = null;
   private pendingTranscriptions = new Map<string, PendingTranscription>();
+  private pendingPlanning = new Map<string, PendingPlanning>();
   // Frames queued while the socket is not yet OPEN
   private sendQueue: Outbound[] = [];
   private reconnectAttempts = 0;
@@ -306,7 +322,33 @@ export class NanobotClient {
     } catch {
       // ignore
     }
+    this.rejectAllPlanning();
     this.setStatus("closed");
+  }
+
+  planning<T>(request: Omit<PlanningRequest, "type" | "request_id">, timeoutMs = 90_000): Promise<T> {
+    if (this.socket?.readyState !== WS_OPEN) {
+      return Promise.reject(new PlanningRpcError("disconnected", "连接已断开，请重连后查询原作业"));
+    }
+    if (this.pendingPlanning.size >= 8) {
+      return Promise.reject(new PlanningRpcError("busy", "规划请求繁忙，请稍后重试"));
+    }
+    const requestId = crypto.randomUUID();
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingPlanning.delete(requestId);
+        reject(new PlanningRpcError("timeout", "规划请求超时；请查询已有规划，勿重复生成"));
+      }, timeoutMs);
+      this.pendingPlanning.set(requestId, { resolve: (data) => resolve(data as T), reject, timer });
+      try {
+        // 规划 RPC 从不进入聊天发送队列，断线后不自动重放。
+        this.socket!.send(JSON.stringify({ ...request, type: "planning", request_id: requestId }));
+      } catch {
+        clearTimeout(timer);
+        this.pendingPlanning.delete(requestId);
+        reject(new PlanningRpcError("disconnected", "规划请求发送失败，请查询原作业"));
+      }
+    });
   }
 
   /** Ask the server to provision a new chat_id; resolves with the assigned id. */
@@ -456,6 +498,16 @@ export class NanobotClient {
       console.log("[nanobot ws inbound]", summarizeInboundWsPayload(parsed));
     }
 
+    if (parsed.event === "planning_response") {
+      const pending = this.pendingPlanning.get(parsed.request_id);
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      this.pendingPlanning.delete(parsed.request_id);
+      if (parsed.ok) pending.resolve(parsed.data);
+      else pending.reject(new PlanningRpcError(parsed.error?.code ?? "service_error", parsed.error?.message ?? "规划操作失败"));
+      return;
+    }
+
     if (parsed.event === "ready") {
       this.readyChatId = parsed.chat_id;
       this.knownChats.add(parsed.chat_id);
@@ -572,6 +624,7 @@ export class NanobotClient {
       this.pendingNewChat = null;
     }
     this.rejectAllTranscriptions("socket closed");
+    this.rejectAllPlanning();
     // Surface structured reasons *before* reconnect logic so the UI can
     // display the error even while the client transparently reconnects.
     // Browsers populate ``CloseEvent.code`` with the wire-level close code;
@@ -626,6 +679,14 @@ export class NanobotClient {
       pending.reject(new Error(detail));
       this.pendingTranscriptions.delete(requestId);
     }
+  }
+
+  private rejectAllPlanning(): void {
+    for (const pending of this.pendingPlanning.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new PlanningRpcError("disconnected", "连接已断开，请重连后查询原作业"));
+    }
+    this.pendingPlanning.clear();
   }
 
   private scheduleReconnect(): void {

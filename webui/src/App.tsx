@@ -14,6 +14,7 @@ import { Sidebar } from "@/components/Sidebar";
 import { SessionSearchDialog } from "@/components/SessionSearchDialog";
 import { SettingsView, type SettingsSectionKey } from "@/components/settings/SettingsView";
 import { ThreadShell } from "@/components/thread/ThreadShell";
+import { PlanningView } from "@/components/planning/PlanningView";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 
 import { useSessions } from "@/hooks/useSessions";
@@ -71,11 +72,12 @@ const SIDEBAR_WIDTH = 272;
 const SIDEBAR_RAIL_WIDTH = 56;
 const TOKEN_REFRESH_MARGIN_MS = 30_000;
 const TOKEN_REFRESH_MIN_DELAY_MS = 5_000;
-type ShellView = "chat" | "settings" | "apps" | "skills";
+type ShellView = "chat" | "settings" | "apps" | "skills" | "planning";
 type ShellRoute = {
   view: ShellView;
   activeKey: string | null;
   settingsSection: SettingsSectionKey;
+  planId?: string | null;
 };
 
 const SETTINGS_SECTION_KEYS: SettingsSectionKey[] = [
@@ -132,6 +134,9 @@ function readShellRoute(): ShellRoute {
   if (path === "/skills") {
     return { view: "skills", activeKey, settingsSection: "skills" };
   }
+  if (path === "/planning" || /^\/planning\/[a-fA-F0-9-]{36}$/.test(path)) {
+    return { view: "planning", activeKey, settingsSection: "overview", planId: path.slice(10) || null };
+  }
   if (path.startsWith("/chat/")) {
     const encoded = path.slice("/chat/".length);
     try {
@@ -158,7 +163,8 @@ function shellRouteHash(route: ShellRoute): string {
     params.set("section", route.settingsSection);
   }
   const query = params.toString();
-  return `#/${route.view}${query ? `?${query}` : ""}`;
+  const suffix = route.view === "planning" && route.planId ? `/${encodeURIComponent(route.planId)}` : "";
+  return `#/${route.view}${suffix}${query ? `?${query}` : ""}`;
 }
 
 function writeShellRoute(route: ShellRoute, replace = false): void {
@@ -532,6 +538,7 @@ function Shell({
     sessions,
     loading,
     refresh,
+    rememberChat,
     createChat,
     forkChat,
     deleteChat,
@@ -545,6 +552,11 @@ function Shell({
     initialRouteRef.current.activeKey,
   );
   const [view, setView] = useState<ShellView>(initialRouteRef.current.view);
+  const [planningPlanId, setPlanningPlanId] = useState<string | null>(initialRouteRef.current.planId ?? null);
+  const [planningWorkspaceScope, setPlanningWorkspaceScope] = useState<WorkspaceScopePayload | null>(null);
+  const routeRef = useRef(initialRouteRef.current);
+  const planningLeaveGuard = useRef<(() => boolean) | null>(null);
+  const setPlanningLeaveGuard = useCallback((guard: (() => boolean) | null) => { planningLeaveGuard.current = guard; }, []);
   const [settingsInitialSection, setSettingsInitialSection] =
     useState<SettingsSectionKey>(initialRouteRef.current.settingsSection);
   const [hostSidebarOpen, setHostSidebarOpen] =
@@ -587,11 +599,16 @@ function Shell({
   const showMainSidebar = view !== "settings";
 
   const navigate = useCallback(
-    (route: ShellRoute, options?: { replace?: boolean }) => {
+    (route: ShellRoute, options?: { replace?: boolean; leaveConfirmed?: boolean }) => {
+      if (!options?.leaveConfirmed && routeRef.current.view === "planning" && shellRouteHash(route) !== shellRouteHash(routeRef.current)
+        && planningLeaveGuard.current && !planningLeaveGuard.current()) return false;
+      routeRef.current = route;
       setActiveKey(route.activeKey);
       setView(route.view);
+      setPlanningPlanId(route.planId ?? null);
       setSettingsInitialSection(route.settingsSection);
       writeShellRoute(route, options?.replace);
+      return true;
     },
     [],
   );
@@ -599,8 +616,15 @@ function Shell({
   useEffect(() => {
     const applyRoute = () => {
       const route = readShellRoute();
+      if (routeRef.current.view === "planning" && shellRouteHash(route) !== shellRouteHash(routeRef.current)
+        && planningLeaveGuard.current && !planningLeaveGuard.current()) {
+        writeShellRoute(routeRef.current, true);
+        return;
+      }
+      routeRef.current = route;
       setActiveKey(route.activeKey);
       setView(route.view);
+      setPlanningPlanId(route.planId ?? null);
       setSettingsInitialSection(route.settingsSection);
       setWorkspaceError(null);
       if (route.view === "chat" && !route.activeKey) {
@@ -923,8 +947,38 @@ function Shell({
     }
   }, [forkChat, navigate, sessions, sidebarState.title_overrides, t]);
 
+  const onOpenPlanning = useCallback(() => {
+    if (routeRef.current.view === "planning") return;
+    if (navigate({ view: "planning", activeKey, settingsSection: "overview", planId: null })) {
+      setPlanningWorkspaceScope(activeWorkspaceScope);
+      setMobileSidebarOpen(false);
+    }
+  }, [activeKey, activeWorkspaceScope, navigate]);
+
+  const onSelectPlanningPlan = useCallback((planId: string | null) => {
+    navigate({ view: "planning", activeKey, settingsSection: "overview", planId });
+  }, [activeKey, navigate]);
+
+  const onPlanningScopeChange = useCallback((scope: WorkspaceScopePayload) => {
+    if (planningLeaveGuard.current && !planningLeaveGuard.current()) return;
+    if (navigate({ view: "planning", activeKey, settingsSection: "overview", planId: null }, { leaveConfirmed: true })) {
+      setPlanningWorkspaceScope(normalizeWorkspaceScope(scope));
+    }
+  }, [activeKey, navigate]);
+
+  const onPlanningHandoff = useCallback(async (chatId: string, scope: WorkspaceScopePayload | null) => {
+    rememberChat(chatId, scope);
+    await refresh();
+    if (!navigate({ view: "chat", activeKey: `websocket:${chatId}`, settingsSection: "overview" })) return;
+    if (scope) {
+      setWorkspaceOverrides((current) => ({ ...current, [chatId]: normalizeWorkspaceScope(scope) }));
+      setDraftWorkspaceScope(normalizeWorkspaceScope(scope));
+    }
+    setMobileSidebarOpen(false);
+  }, [navigate, refresh, rememberChat]);
+
   const onNewChat = useCallback(() => {
-    navigate(defaultShellRoute());
+    if (!navigate(defaultShellRoute())) return;
     setDraftWorkspaceScope(null);
     setWorkspaceError(null);
     setSessionSearchOpen(false);
@@ -939,7 +993,7 @@ function Shell({
         onNewChat();
         return;
       }
-      navigate(defaultShellRoute());
+      if (!navigate(defaultShellRoute())) return;
       setDraftWorkspaceScope(normalizeWorkspaceScope({
         project_path: trimmed,
         project_name: projectName || projectNameFromPath(trimmed),
@@ -954,6 +1008,7 @@ function Shell({
 
   const onSelectChat = useCallback(
     (key: string) => {
+      if (!navigate({ view: "chat", activeKey: key, settingsSection: "overview" })) return;
       const selected = sessions.find((session) => session.key === key);
       const selectedChatId = selected?.chatId;
       if (selectedChatId) {
@@ -970,7 +1025,6 @@ function Shell({
         setDraftWorkspaceScope(null);
       }
       setWorkspaceError(null);
-      navigate({ view: "chat", activeKey: key, settingsSection: "overview" });
       setMobileSidebarOpen(false);
     },
     [navigate, sessions],
@@ -1328,6 +1382,10 @@ function Shell({
     : t("app.brand");
 
   useEffect(() => {
+    if (view === "planning") {
+      document.title = "任务规划 · nanobot";
+      return;
+    }
     if (view === "settings") {
       document.title = t("app.documentTitle.chat", {
         title: t("settings.sidebar.title"),
@@ -1367,8 +1425,9 @@ function Shell({
     onOpenSettings,
     onOpenApps,
     onOpenSkills,
+    onOpenPlanning,
     onOpenSearch: onOpenSessionSearch,
-    activeUtility: view === "apps" || view === "skills" ? view : null,
+    activeUtility: view === "apps" || view === "skills" || view === "planning" ? view : null,
     onToggleArchived,
     pinnedKeys: sidebarState.pinned_keys,
     archivedKeys: sidebarState.archived_keys,
@@ -1554,7 +1613,14 @@ function Shell({
                 onOpenModelSettings={onOpenModelSettings}
               />
             </div>
-            {view !== "chat" && (
+            {view === "planning" && (
+              <div className="absolute inset-0 flex flex-col" style={showHostChrome ? { paddingTop: "2.85rem" } : undefined}>
+                <PlanningView planId={planningPlanId} scope={planningWorkspaceScope ?? activeWorkspaceScope}
+                  workspaces={workspaces} onSelectPlan={onSelectPlanningPlan} onHandoff={onPlanningHandoff}
+                  onScopeChange={onPlanningScopeChange} onToggleSidebar={toggleSidebar} onLeaveGuardChange={setPlanningLeaveGuard} />
+              </div>
+            )}
+            {view !== "chat" && view !== "planning" && (
               <div className="absolute inset-0 flex flex-col">
                 <SettingsView
                   theme={theme}
